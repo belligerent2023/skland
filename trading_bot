@@ -41,10 +41,10 @@ for handler in logging.root.handlers:
 # ==================== CONFIGURATION ====================
 class Config:
     # API Credentials
-    OKX_API_KEY = "sxWa4TqpZCsH2T8xr1DDzJ62AS0FY9QYDrvhPhrSPTkzT1u7OwIBrUneIhJ8jxPXRSiveacph039ePt0a2vaw"
-    OKX_API_SECRET = "WIc43OAoMYR6mv4cjdCi2mh1w7LN7t0RmqJgQK2caFaVVH6CwCLrvUTxq2qkChNKvhFdBXP7oTCLthw4UZ98A"
-    TELEGRAM_TOKEN = "8553570716:AAG15P1Vq_glwhORxAwOHDdD7lV7TlPcwGA"
-    TELEGRAM_CHAT_ID = "1123013458"
+    OKX_API_KEY = ""
+    OKX_API_SECRET = ""
+    TELEGRAM_TOKEN = ""
+    TELEGRAM_CHAT_ID = ""
     
     # Trading Parameters
     TRADING_PAIRS = [
