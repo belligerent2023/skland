@@ -1,0 +1,1301 @@
+# SellDrop API Reference
+Base URL: https://dashboard.selldrop.io/api/v1
+
+## Authentication
+Include your API key in the Authorization header: `Authorization: Bearer <your-api-key>`
+
+============================================================
+## Products
+============================================================
+
+### GET /products/list
+**List Products**
+Returns a paginated list of all visible (public + unlisted) products for your store, sorted by priority then most recent. Hidden and private products are excluded.
+
+Parameters:
+  - page [integer] (optional, default: 1) — Page number
+  - limit [integer] (optional, default: 20) — Results per page
+  - category [string (UUID)] (optional) — Filter by category ID
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/products/list?limit=5" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": [
+    {
+      "id": "d3f1a2b4-c5e6-4a7b-8c9d-0e1f2a3b4c5d",
+      "name": "Pro License",
+      "slug": "pro-license",
+      "description": "Lifetime access to the Pro plan.",
+      "price": 4900,
+      "stock": -1,
+      "type": "file",
+      "visibility": "public",
+      "cover_url": "https://cdn.example.com/cover.png",
+      "created_at": "2026-01-15T12:00:00Z",
+      "updated_at": "2026-01-15T12:00:00Z",
+      "group_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "groups": {
+        "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "name": "Software",
+        "slug": "software"
+      },
+      "category_id": "e5f6a7b8-9012-3456-efab-234567890123",
+      "categories": {
+        "id": "e5f6a7b8-9012-3456-efab-234567890123",
+        "name": "Digital",
+        "slug": "digital"
+      },
+      "variants": [
+        {
+          "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+          "name": "Default",
+          "price": 4900,
+          "stock": -1,
+          "sort_order": 0,
+          "is_default": true,
+          "created_at": "2026-01-15T12:00:00Z",
+          "updated_at": "2026-01-15T12:00:00Z"
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "page": 1,
+    "limit": 5,
+    "total": 42,
+    "pages": 9
+  }
+}
+
+Status Codes:
+  200 — Products retrieved successfully.
+  401 — Unauthorized. Missing or invalid API key.
+  500 — Internal server error.
+
+Note: Stock of -1 means unlimited. Products are sorted by sort_priority (desc) then created_at (desc). Each product includes a variants array with all its variants.
+
+---
+
+### GET /products/get
+**Get Product**
+Fetch a single product by its UUID or URL slug. Returns 404 if the product is hidden or belongs to another store.
+
+Parameters:
+  - id [string] (required) — Product UUID or URL slug
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/products/get?id=pro-license" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": {
+    "id": "d3f1a2b4-c5e6-4a7b-8c9d-0e1f2a3b4c5d",
+    "name": "Pro License",
+    "slug": "pro-license",
+    "description": "Lifetime access to the Pro plan.",
+    "price": 4900,
+    "stock": -1,
+    "type": "file",
+    "visibility": "public",
+    "cover_url": "https://cdn.example.com/cover.png",
+    "custom_fields": [],
+    "volume_discounts": [],
+    "pay_what_you_want": null,
+    "created_at": "2026-01-15T12:00:00Z",
+    "updated_at": "2026-01-15T12:00:00Z",
+    "group_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "groups": {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "Software",
+      "slug": "software"
+    },
+    "category_id": "e5f6a7b8-9012-3456-efab-234567890123",
+    "categories": {
+      "id": "e5f6a7b8-9012-3456-efab-234567890123",
+      "name": "Digital",
+      "slug": "digital"
+    },
+    "variants": [
+      {
+        "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "name": "Default",
+        "price": 4900,
+        "stock": -1,
+        "sort_order": 0,
+        "is_default": true,
+        "min_quantity": 1,
+        "max_quantity": 99999,
+        "service_text": null,
+        "created_at": "2026-01-15T12:00:00Z",
+        "updated_at": "2026-01-15T12:00:00Z"
+      }
+    ]
+  }
+}
+
+Status Codes:
+  200 — Product retrieved successfully.
+  404 — Product not found.
+  401 — Unauthorized.
+
+Note: You can pass either the product UUID or its slug. Both work. The response includes all variants for the product.
+
+---
+
+### POST /products/create
+**Create Product**
+Create a new product in your store with full control over delivery, pricing, SEO, security, and more. The slug is auto-generated from the name if not provided.
+
+Parameters:
+  - name [string] (required) — Product name
+  - price [integer] (required) — Price in smallest currency unit (e.g. cents). 4900 = $49.00
+  - slug [string] (optional) — URL slug (auto-generated from name if omitted)
+  - description [string] (optional) — Product description (supports markdown)
+  - currency [string] (optional, default: usd) — Currency code, e.g. usd, eur, gbp
+  - type [string] (optional, default: serials) — serials | file | text | webhook
+  - visibility [string] (optional, default: public) — public | unlisted | private | on_hold
+  - category_id [string (UUID)] (optional) — Category UUID (from /categories/) to assign product to
+  - group_id [string (UUID)] (optional) — Group UUID (from /groups/) to assign product to
+  - cover_url [string] (optional) — Cover image URL or base64 data URI (e.g. data:image/png;base64,...)
+  - gallery_urls [string[]] (optional) — Array of gallery image URLs or base64 data URIs (max 8)
+  - embed_cover_url [string] (optional) — Embed widget image. URL or base64 data URI
+  - og_image [string] (optional) — Open Graph image. URL or base64 data URI
+  - stock [integer] (optional, default: -1) — -1 for unlimited
+  - stock_warning [integer] (optional, default: 0) — Alert when stock drops below this
+  - min_quantity [integer] (optional, default: 1) — Minimum order quantity
+  - max_quantity [integer] (optional, default: 99999) — Maximum order quantity
+  - serials [string[]] (optional) — Array of serial keys/codes (for type=serials)
+  - serials_remove_duplicates [boolean] (optional, default: false) — Auto-deduplicate serials
+  - service_text [string] (optional) — Text content delivered to buyer (for type=text)
+  - dynamic_webhook [string] (optional) — Webhook URL for dynamic delivery (for type=webhook)
+  - webhook_events [string[]] (optional) — Trigger events: invoice.created, order.completed, order.refunded
+  - delivery_text [string] (optional) — Post-purchase message shown to buyer
+  - custom_fields [array] (optional) — Custom checkout fields [{type, name, required, placeholder}]
+  - volume_discounts [array] (optional) — Tiered pricing [{quantity, discount, disableWithCoupon}]
+  - disabled_payment_methods [string[]] (optional) — Payment methods to block (e.g. stripe, paypal, crypto)
+  - warranty_text [string] (optional) — Warranty/guarantee info text
+  - terms_of_service [string] (optional) — Purchase agreement text
+  - discord_integration [boolean] (optional) — Enable Discord integration
+  - discord_optional [boolean] (optional, default: true) — Whether Discord join is optional
+  - discord_role_id [string] (optional) — Discord role ID to auto-assign
+  - seo_title [string] (optional) — Custom SEO title (max 70 chars)
+  - seo_description [string] (optional) — Custom SEO description (max 160 chars)
+  - variants [array] (optional) — Array of variant objects. If omitted, a default variant is auto-created from product fields. Each object: {name, price, currency?, stock?, sort_order?, is_default?, service_text?, file_key?, file_name?, file_size?, delivery_text?, dynamic_webhook?, webhook_events?, min_quantity?, max_quantity?, stock_warning?, volume_discounts?, serials?}
+
+Example (cURL):
+curl -X POST "https://dashboard.selldrop.io/api/v1/products/create" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"name":"Pro License","price":4900,"type":"file","variants":[{"name":"Standard","price":4900,"currency":"usd","is_default":true},{"name":"Premium","price":9900,"currency":"usd"}]}'
+
+Response:
+{
+  "data": {
+    "id": "d3f1a2b4-c5e6-4a7b-8c9d-0e1f2a3b4c5d",
+    "name": "Pro License",
+    "slug": "pro-license",
+    "price": 4900,
+    "type": "file",
+    "visibility": "public",
+    "stock": -1,
+    "created_at": "2026-03-07T12:00:00Z",
+    "updated_at": "2026-03-07T12:00:00Z",
+    "variants": [
+      {
+        "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "name": "Standard",
+        "price": 4900,
+        "stock": -1,
+        "sort_order": 0,
+        "is_default": true,
+        "created_at": "2026-03-07T12:00:00Z",
+        "updated_at": "2026-03-07T12:00:00Z"
+      },
+      {
+        "id": "b2c3d4e5-f6a7-8901-bcde-f01234567891",
+        "name": "Premium",
+        "price": 9900,
+        "stock": -1,
+        "sort_order": 1,
+        "is_default": false,
+        "created_at": "2026-03-07T12:00:00Z",
+        "updated_at": "2026-03-07T12:00:00Z"
+      }
+    ]
+  }
+}
+
+Status Codes:
+  201 — Product created successfully.
+  400 — Validation error. Missing or invalid fields.
+  401 — Unauthorized.
+  409 — Slug conflict.
+  413 — Storage limit exceeded.
+
+Note: Returns 409 if a product with the same slug already exists. Price is in cents (4900 = $49.00). If no variants are provided, a default variant is auto-created from the product-level fields. Each variant can have its own serials array — when provided, the variant stock is auto-set to the serial count. Image fields accept a URL, a base64 data URI (data:image/png;base64,...), or an existing R2 key. Uploaded images count toward your store storage quota (250 MB free, 1 GB Pro).
+
+---
+
+### PATCH /products/update
+**Update Product**
+Update an existing product. Only the fields you include in the request body will be changed. All other fields remain untouched.
+
+Parameters:
+  - id [string (UUID)] (required) — Product UUID
+  - name [string] (optional) — Product name
+  - slug [string] (optional) — URL slug
+  - description [string] (optional) — Product description (supports markdown)
+  - price [integer] (optional) — Price in cents
+  - currency [string] (optional) — Currency code
+  - type [string] (optional) — serials | file | text | webhook
+  - visibility [string] (optional) — public | unlisted | private | on_hold
+  - category_id [string (UUID)] (optional) — Category UUID from /categories/ (null to remove)
+  - group_id [string (UUID)] (optional) — Group UUID from /groups/ (null to remove)
+  - cover_url [string] (optional) — Cover image URL or base64 data URI
+  - gallery_urls [string[]] (optional) — Array of gallery image URLs or base64 data URIs (max 8)
+  - embed_cover_url [string] (optional) — Embed widget image. URL or base64 data URI
+  - og_image [string] (optional) — Open Graph image. URL or base64 data URI
+  - stock [integer] (optional) — -1 for unlimited
+  - stock_warning [integer] (optional) — Low stock alert threshold
+  - min_quantity [integer] (optional) — Minimum order quantity
+  - max_quantity [integer] (optional) — Maximum order quantity
+  - serials [string[]] (optional) — Array of serial keys (replaces existing)
+  - serials_remove_duplicates [boolean] (optional) — Auto-deduplicate serials
+  - service_text [string] (optional) — Text content for type=text
+  - dynamic_webhook [string] (optional) — Webhook URL for type=webhook
+  - webhook_events [string[]] (optional) — Trigger events: invoice.created, order.completed, order.refunded
+  - delivery_text [string] (optional) — Post-purchase message
+  - custom_fields [array] (optional) — Custom checkout fields [{type, name, required, placeholder}]
+  - volume_discounts [array] (optional) — Tiered pricing [{quantity, discount, disableWithCoupon}]
+  - disabled_payment_methods [string[]] (optional) — Payment methods to block
+  - warranty_text [string] (optional) — Warranty/guarantee info text
+  - terms_of_service [string] (optional) — Purchase agreement text
+  - discord_integration [boolean] (optional) — Enable Discord integration
+  - discord_optional [boolean] (optional) — Whether Discord join is optional
+  - discord_role_id [string] (optional) — Discord role ID to auto-assign
+  - seo_title [string] (optional) — Custom SEO title
+  - seo_description [string] (optional) — Custom SEO description
+  - variants_create [array] (optional) — Array of new variant objects to add. Each: {name, price, currency?, stock?, sort_order?, service_text?, serials?, ...}
+  - variants_update [array] (optional) — Array of existing variant updates. Each must include id (variant UUID) plus fields to change: {id, name?, price?, currency?, stock?, sort_order?, service_text?, serials?, ...}
+  - variants_delete [string[]] (optional) — Array of variant UUIDs to delete. Cannot delete the default variant.
+  - variants_reorder [string[]] (optional) — Ordered array of ALL variant UUIDs for the product. Assigns sort_order based on array position (0, 1, 2, ...). All existing variant IDs must be included — no partial reorders.
+
+Example (cURL):
+curl -X PATCH "https://dashboard.selldrop.io/api/v1/products/update" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"id":"PRODUCT_UUID","price":5900}'
+
+Response:
+{
+  "data": {
+    "id": "d3f1a2b4-c5e6-4a7b-8c9d-0e1f2a3b4c5d",
+    "name": "Pro License",
+    "slug": "pro-license",
+    "price": 5900,
+    "type": "file",
+    "visibility": "unlisted",
+    "stock": -1,
+    "updated_at": "2026-03-07T12:30:00Z",
+    "variants": [
+      {
+        "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "name": "Default",
+        "price": 5900,
+        "stock": -1,
+        "sort_order": 0,
+        "is_default": true,
+        "created_at": "2026-03-07T12:00:00Z",
+        "updated_at": "2026-03-07T12:30:00Z"
+      },
+      {
+        "id": "b2c3d4e5-f6a7-8901-bcde-f01234567891",
+        "name": "Premium",
+        "price": 9900,
+        "stock": -1,
+        "sort_order": 100,
+        "is_default": false,
+        "created_at": "2026-03-07T12:30:00Z",
+        "updated_at": "2026-03-07T12:30:00Z"
+      }
+    ]
+  }
+}
+
+Status Codes:
+  200 — Product updated successfully.
+  400 — Validation error or attempted to delete the default variant.
+  401 — Unauthorized.
+  404 — Product or variant not found.
+  409 — Slug conflict.
+  413 — Storage limit exceeded.
+
+Note: Returns 404 if the product doesn't exist or belongs to another store. Use variants_create to add new variants, variants_update to modify existing ones (by id), variants_delete to remove them, and variants_reorder to bulk-reorder all variants by sort position. The default variant cannot be deleted. When serials are provided in a variant update/create, stock is auto-set to the serial count. Image fields accept a URL, a base64 data URI, or an existing R2 key.
+
+---
+
+### DELETE /products/delete
+**Delete Product**
+Permanently delete a product by its UUID. This cannot be undone.
+
+Parameters:
+  - id [string (UUID)] (required) — Product UUID
+
+Example (cURL):
+curl -X DELETE "https://dashboard.selldrop.io/api/v1/products/delete" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"id":"PRODUCT_UUID"}'
+
+Response:
+{
+  "success": true,
+  "deleted_id": "d3f1a2b4-c5e6-4a7b-8c9d-0e1f2a3b4c5d"
+}
+
+Status Codes:
+  200 — Product deleted successfully.
+  401 — Unauthorized.
+  404 — Product not found.
+
+---
+
+============================================================
+## Stock
+============================================================
+
+### GET /stock/get
+**Get Stock**
+Get current stock levels for a product's variants. Optionally filter to a single variant. For serial products, also returns the serial count.
+
+Parameters:
+  - product_id [string (UUID)] (required) — Product UUID
+  - variant_id [string (UUID)] (optional) — Variant UUID. If omitted, returns stock for all variants.
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/stock/get?product_id=PRODUCT_UUID" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": {
+    "product_id": "d3f1a2b4-c5e6-4a7b-8c9d-0e1f2a3b4c5d",
+    "type": "serials",
+    "variants": [
+      {
+        "variant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "name": "Default",
+        "stock": 42,
+        "is_default": true,
+        "sort_order": 0,
+        "serial_count": 42
+      }
+    ]
+  }
+}
+
+Status Codes:
+  200 — Stock retrieved successfully.
+  401 — Unauthorized.
+  404 — Product or variant not found.
+
+Note: Stock of -1 means unlimited. serial_count is only included for serial-type products.
+
+---
+
+### POST /stock/add
+**Add Stock**
+Increase stock for a variant. For serial products, provide an array of serial keys. For other types, provide a quantity to increment or set_stock to set an exact value.
+
+Parameters:
+  - product_id [string (UUID)] (required) — Product UUID
+  - variant_id [string (UUID)] (optional) — Variant UUID. Defaults to the default variant.
+  - quantity [integer] (optional) — Amount to add to current stock (non-serial products)
+  - set_stock [integer] (optional) — Set stock to this exact value. Use -1 for unlimited.
+  - serials [string[]] (optional) — Array of serial keys to add (serial products only)
+
+Example (cURL):
+curl -X POST "https://dashboard.selldrop.io/api/v1/stock/add" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"product_id":"PRODUCT_UUID","quantity":10}'
+
+Response:
+{
+  "data": {
+    "variant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "stock": 52
+  }
+}
+
+Status Codes:
+  200 — Stock updated successfully.
+  400 — Missing/invalid parameters.
+  401 — Unauthorized.
+  404 — Product or variant not found.
+
+Note: For serial products, provide serials[] to add keys — stock is auto-calculated from serial count. For non-serial products, use quantity (increment) or set_stock (absolute). Provide exactly one of these options.
+
+---
+
+### POST /stock/remove
+**Remove Stock**
+Decrease stock for a variant. For serial products, remove specific serials by ID or value. For other types, provide a quantity to decrement.
+
+Parameters:
+  - product_id [string (UUID)] (required) — Product UUID
+  - variant_id [string (UUID)] (optional) — Variant UUID. Defaults to the default variant.
+  - quantity [integer] (optional) — Amount to subtract from current stock (non-serial products)
+  - serial_ids [string[]] (optional) — Array of serial UUIDs to remove (serial products)
+  - serials [string[]] (optional) — Array of serial key values to remove (serial products)
+
+Example (cURL):
+curl -X POST "https://dashboard.selldrop.io/api/v1/stock/remove" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"product_id":"PRODUCT_UUID","quantity":5}'
+
+Response:
+{
+  "data": {
+    "variant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "stock": 47
+  }
+}
+
+Status Codes:
+  200 — Stock updated successfully.
+  400 — Missing/invalid parameters or insufficient stock.
+  401 — Unauthorized.
+  404 — Product or variant not found.
+
+Note: For serial products, use serial_ids (UUIDs) or serials (key values) to remove specific entries — stock is auto-recalculated. For non-serial products, use quantity to decrement atomically. Returns an error if stock would go below 0.
+
+---
+
+============================================================
+## Orders
+============================================================
+
+### GET /orders/list
+**List Orders**
+Returns a paginated list of orders for your store. Optionally filter by status or customer email address.
+
+Parameters:
+  - page [integer] (optional, default: 1) — Page number
+  - limit [integer] (optional, default: 20) — Results per page
+  - status [string] (optional) — pending | completed | refunded | failed
+  - email [string] (optional) — Filter by customer email (case-insensitive)
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/orders/list?status=completed&limit=10" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": [
+    {
+      "id": "e5f6a7b8-9012-3456-efab-234567890123",
+      "status": "completed",
+      "amount": 4900,
+      "currency": "usd",
+      "quantity": 1,
+      "payment_method": "stripe",
+      "created_at": "2026-02-10T08:30:00Z",
+      "product": {
+        "id": "d3f1a2b4-c5e6-4a7b-8c9d-0e1f2a3b4c5d",
+        "name": "Pro License",
+        "slug": "pro-license"
+      }
+    }
+  ],
+  "meta": {
+    "page": 1,
+    "limit": 10,
+    "total": 128,
+    "pages": 13
+  }
+}
+
+Status Codes:
+  200 — Orders retrieved successfully.
+  401 — Unauthorized.
+  500 — Internal server error.
+
+---
+
+### GET /orders/get
+**Get Order**
+Fetch a single order by its UUID. Returns 404 if the order belongs to another store.
+
+Parameters:
+  - id [string (UUID)] (required) — Order UUID
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/orders/get?id=ORDER_UUID" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": {
+    "id": "e5f6a7b8-9012-3456-efab-234567890123",
+    "status": "completed",
+    "amount": 4900,
+    "currency": "usd",
+    "quantity": 1,
+    "payment_method": "stripe",
+    "created_at": "2026-02-10T08:30:00Z",
+    "updated_at": "2026-02-10T08:31:12Z",
+    "product": {
+      "id": "d3f1a2b4-c5e6-4a7b-8c9d-0e1f2a3b4c5d",
+      "name": "Pro License",
+      "slug": "pro-license",
+      "type": "file"
+    }
+  }
+}
+
+Status Codes:
+  200 — Order retrieved successfully.
+  401 — Unauthorized.
+  404 — Order not found.
+
+---
+
+### POST /orders/create
+**Create Order**
+Create a new order. The customer is automatically created or matched by email address.
+
+Parameters:
+  - email [string] (required) — Customer email (auto-creates customer if needed)
+  - product_id [string (UUID)] (required) — Product UUID
+  - amount [integer] (required) — Total amount in cents
+  - currency [string] (optional, default: usd) — Currency code
+  - quantity [integer] (optional, default: 1) — Quantity
+  - status [string] (optional, default: pending) — pending | completed | refunded | failed
+  - payment_method [string] (optional, default: api) — Payment method label
+
+Example (cURL):
+curl -X POST "https://dashboard.selldrop.io/api/v1/orders/create" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"email":"customer@example.com","product_id":"PRODUCT_UUID","amount":4900}'
+
+Response:
+{
+  "data": {
+    "id": "e5f6a7b8-9012-3456-efab-234567890123",
+    "status": "pending",
+    "amount": 4900,
+    "currency": "usd",
+    "quantity": 1,
+    "payment_method": "api",
+    "created_at": "2026-03-07T12:00:00Z"
+  }
+}
+
+Status Codes:
+  200 — Order created successfully.
+  400 — Validation error.
+  401 — Unauthorized.
+
+Note: The product must exist in the specified store. Amount is in cents (4900 = $49.00).
+
+---
+
+### PATCH /orders/update
+**Update Order**
+Update an existing order. Only the fields you include will be changed.
+
+Parameters:
+  - id [string (UUID)] (required) — Order UUID
+  - status [string] (optional) — pending | completed | refunded | failed
+  - amount [integer] (optional) — Amount in cents
+  - currency [string] (optional) — Currency code
+  - quantity [integer] (optional) — Quantity
+
+Example (cURL):
+curl -X PATCH "https://dashboard.selldrop.io/api/v1/orders/update" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"id":"ORDER_UUID","status":"completed"}'
+
+Response:
+{
+  "data": {
+    "id": "e5f6a7b8-9012-3456-efab-234567890123",
+    "status": "completed",
+    "amount": 4900,
+    "currency": "usd",
+    "quantity": 1,
+    "payment_method": "api",
+    "updated_at": "2026-03-07T12:30:00Z"
+  }
+}
+
+Status Codes:
+  200 — Order updated successfully.
+  400 — Validation error.
+  401 — Unauthorized.
+  404 — Order not found.
+
+---
+
+### DELETE /orders/delete
+**Delete Order**
+Permanently delete an order by its UUID. This cannot be undone.
+
+Parameters:
+  - id [string (UUID)] (required) — Order UUID
+
+Example (cURL):
+curl -X DELETE "https://dashboard.selldrop.io/api/v1/orders/delete" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"id":"ORDER_UUID"}'
+
+Response:
+{
+  "success": true,
+  "deleted_id": "e5f6a7b8-9012-3456-efab-234567890123"
+}
+
+Status Codes:
+  200 — Order deleted successfully.
+  401 — Unauthorized.
+  404 — Order not found.
+
+---
+
+============================================================
+## Groups
+============================================================
+
+### GET /groups/list
+**List Groups**
+Returns a paginated list of all groups (product groupings) for your store, sorted by priority then name.
+
+Parameters:
+  - page [integer] (optional, default: 1) — Page number
+  - limit [integer] (optional, default: 50) — Results per page
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/groups/list" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "Nitro Tokens",
+      "slug": "nitro-tokens",
+      "description": "Discord Nitro token products",
+      "sort_priority": 10,
+      "status": "public",
+      "cover_url": null,
+      "embed_cover_url": null,
+      "created_at": "2026-01-10T08:00:00Z"
+    }
+  ],
+  "meta": {
+    "page": 1,
+    "limit": 50,
+    "total": 5,
+    "pages": 1
+  }
+}
+
+Status Codes:
+  200 — Groups retrieved successfully.
+  401 — Unauthorized.
+
+---
+
+### GET /groups/get
+**Get Group**
+Fetch a single group by its UUID or slug.
+
+Parameters:
+  - id [string] (required) — Group UUID or slug
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/groups/get?id=nitro-tokens" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": {
+    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "name": "Nitro Tokens",
+    "slug": "nitro-tokens",
+    "description": "Discord Nitro token products",
+    "sort_priority": 10,
+    "status": "public",
+    "cover_url": null,
+    "embed_cover_url": null,
+    "created_at": "2026-01-10T08:00:00Z"
+  }
+}
+
+Status Codes:
+  200 — Group retrieved successfully.
+  401 — Unauthorized.
+  404 — Group not found.
+
+---
+
+### POST /groups/create
+**Create Group**
+Create a new group. The slug is auto-generated from the name if not provided. Groups are product groupings — use categories for storefront filter tabs.
+
+Parameters:
+  - name [string] (required) — Group name
+  - slug [string] (optional) — URL slug (auto-generated if omitted)
+  - description [string] (optional) — Group description
+  - sort_priority [integer] (optional, default: 0) — Sort priority (higher = first)
+  - status [string] (optional, default: public) — public | unlisted | on_hold
+  - cover_url [string] (optional) — Cover image URL or base64 data URI
+  - embed_cover_url [string] (optional) — Embed widget image. URL or base64 data URI
+
+Example (cURL):
+curl -X POST "https://dashboard.selldrop.io/api/v1/groups/create" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"name":"Nitro Tokens"}'
+
+Response:
+{
+  "data": {
+    "id": "b2c3d4e5-f6a7-8901-bcde-f01234567891",
+    "name": "Nitro Tokens",
+    "slug": "nitro-tokens",
+    "description": null,
+    "sort_priority": 0,
+    "status": "public",
+    "cover_url": null,
+    "embed_cover_url": null,
+    "created_at": "2026-03-07T12:00:00Z"
+  }
+}
+
+Status Codes:
+  201 — Group created successfully.
+  400 — Validation error.
+  401 — Unauthorized.
+  409 — Slug conflict.
+  413 — Storage limit exceeded.
+
+---
+
+### PATCH /groups/update
+**Update Group**
+Update an existing group. Only the fields you include will be changed.
+
+Parameters:
+  - id [string (UUID)] (required) — Group UUID
+  - name [string] (optional) — Group name
+  - slug [string] (optional) — URL slug
+  - description [string] (optional) — Description (null to remove)
+  - sort_priority [integer] (optional) — Sort priority
+  - status [string] (optional) — public | unlisted | on_hold
+  - cover_url [string] (optional) — Cover image URL or base64 data URI (null to remove)
+  - embed_cover_url [string] (optional) — Embed widget image. URL or base64 data URI (null to remove)
+
+Example (cURL):
+curl -X PATCH "https://dashboard.selldrop.io/api/v1/groups/update" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"id":"GROUP_UUID","name":"Premium Nitro Tokens"}'
+
+Response:
+{
+  "data": {
+    "id": "b2c3d4e5-f6a7-8901-bcde-f01234567891",
+    "name": "Premium Nitro Tokens",
+    "slug": "nitro-tokens",
+    "description": null,
+    "sort_priority": 0,
+    "status": "public",
+    "cover_url": null,
+    "embed_cover_url": null,
+    "updated_at": "2026-03-07T12:30:00Z"
+  }
+}
+
+Status Codes:
+  200 — Group updated successfully.
+  401 — Unauthorized.
+  404 — Group not found.
+  413 — Storage limit exceeded.
+
+---
+
+### DELETE /groups/delete
+**Delete Group**
+Permanently delete a group. Products in this group will have their group_id set to null.
+
+Parameters:
+  - id [string (UUID)] (required) — Group UUID
+
+Example (cURL):
+curl -X DELETE "https://dashboard.selldrop.io/api/v1/groups/delete" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"id":"GROUP_UUID"}'
+
+Response:
+{
+  "success": true,
+  "deleted_id": "b2c3d4e5-f6a7-8901-bcde-f01234567891"
+}
+
+Status Codes:
+  200 — Group deleted successfully.
+  401 — Unauthorized.
+  404 — Group not found.
+
+---
+
+============================================================
+## Coupons
+============================================================
+
+### GET /coupons/list
+**List Coupons**
+Returns a paginated list of all coupons for your store. Optionally filter by active status.
+
+Parameters:
+  - page [integer] (optional, default: 1) — Page number
+  - limit [integer] (optional, default: 20) — Results per page
+  - active [boolean] (optional) — Filter by active status
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/coupons/list" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": [
+    {
+      "id": "f1e2d3c4-b5a6-7890-bcde-f01234567892",
+      "code": "SAVE20",
+      "discount_type": "percentage",
+      "discount_value": 20,
+      "max_uses": -1,
+      "used_count": 12,
+      "is_active": true,
+      "expires_at": "2026-12-31T23:59:59Z",
+      "created_at": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "meta": {
+    "page": 1,
+    "limit": 20,
+    "total": 8,
+    "pages": 1
+  }
+}
+
+Status Codes:
+  200 — Coupons retrieved successfully.
+  401 — Unauthorized.
+
+---
+
+### GET /coupons/get
+**Get Coupon**
+Fetch a single coupon by its UUID or code.
+
+Parameters:
+  - id [string (UUID)] (optional) — Coupon UUID
+  - code [string] (optional) — Coupon code (case-insensitive)
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/coupons/get?code=SAVE20" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": {
+    "id": "f1e2d3c4-b5a6-7890-bcde-f01234567892",
+    "code": "SAVE20",
+    "discount_type": "percentage",
+    "discount_value": 20,
+    "max_uses": -1,
+    "used_count": 12,
+    "is_active": true,
+    "expires_at": "2026-12-31T23:59:59Z",
+    "created_at": "2026-01-01T00:00:00Z"
+  }
+}
+
+Status Codes:
+  200 — Coupon retrieved successfully.
+  401 — Unauthorized.
+  404 — Coupon not found.
+
+Note: Provide either id or code. At least one is required.
+
+---
+
+### POST /coupons/validate
+**Validate Coupon**
+Check whether a coupon code is valid for a given product. This is read-only and does not consume the coupon.
+
+Parameters:
+  - code [string] (required) — Coupon code (case-insensitive)
+  - product_id [string (UUID)] (required) — Product UUID to validate against
+
+Example (cURL):
+curl -X POST "https://dashboard.selldrop.io/api/v1/coupons/validate" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"code":"SAVE20","product_id":"PRODUCT_UUID"}'
+
+Response:
+{
+  "valid": true,
+  "code": "SAVE20",
+  "discount_type": "percent",
+  "discount_value": 20,
+  "uses_remaining": 48,
+  "expires_at": "2026-12-31T23:59:59Z"
+}
+
+Status Codes:
+  200 — Validation result returned.
+  400 — Missing required fields.
+  401 — Unauthorized.
+
+---
+
+### POST /coupons/create
+**Create Coupon**
+Create a new coupon code. The code is automatically uppercased.
+
+Parameters:
+  - code [string] (required) — Coupon code (auto-uppercased)
+  - discount_type [string] (required) — percentage | fixed
+  - discount_value [number] (required) — Percentage (1-100) or fixed amount in cents
+  - currency [string] (optional, default: usd) — Required for fixed discounts
+  - product_ids [uuid[]] (optional) — Scope to specific products
+  - category_ids [uuid[]] (optional) — Scope to specific categories
+  - min_order_amount [integer] (optional, default: 0) — Minimum order amount in cents
+  - max_uses [integer] (optional, default: -1) — -1 for unlimited
+  - max_uses_per_customer [integer] (optional, default: 0) — Max uses per customer (0 = unlimited)
+  - starts_at [string (ISO 8601)] (optional) — Start date
+  - expires_at [string (ISO 8601)] (optional) — Expiration date
+  - is_active [boolean] (optional, default: true) — Active status
+
+Example (cURL):
+curl -X POST "https://dashboard.selldrop.io/api/v1/coupons/create" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"code":"LAUNCH50","discount_type":"percentage","discount_value":50}'
+
+Response:
+{
+  "data": {
+    "id": "f1e2d3c4-b5a6-7890-bcde-f01234567892",
+    "code": "LAUNCH50",
+    "discount_type": "percentage",
+    "discount_value": 50,
+    "max_uses": -1,
+    "is_active": true,
+    "created_at": "2026-03-07T12:00:00Z"
+  }
+}
+
+Status Codes:
+  200 — Coupon created successfully.
+  400 — Validation error.
+  401 — Unauthorized.
+  409 — Code already exists.
+
+---
+
+### PATCH /coupons/update
+**Update Coupon**
+Update an existing coupon. Only the fields you include will be changed.
+
+Parameters:
+  - id [string (UUID)] (required) — Coupon UUID
+  - code [string] (optional) — Coupon code
+  - discount_type [string] (optional) — percentage | fixed
+  - discount_value [number] (optional) — Discount amount
+  - currency [string] (optional) — Currency code
+  - product_ids [uuid[]] (optional) — Scope to specific products ([] to clear)
+  - category_ids [uuid[]] (optional) — Scope to specific categories ([] to clear)
+  - min_order_amount [integer] (optional) — Minimum order amount in cents
+  - max_uses [integer] (optional) — -1 for unlimited
+  - max_uses_per_customer [integer] (optional) — Max uses per customer
+  - starts_at [string (ISO 8601)] (optional) — Start date (null to remove)
+  - expires_at [string (ISO 8601)] (optional) — Expiration date (null to remove)
+  - is_active [boolean] (optional) — Active status
+
+Example (cURL):
+curl -X PATCH "https://dashboard.selldrop.io/api/v1/coupons/update" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"id":"COUPON_UUID","is_active":false}'
+
+Response:
+{
+  "data": {
+    "id": "f1e2d3c4-b5a6-7890-bcde-f01234567892",
+    "code": "LAUNCH50",
+    "discount_type": "percentage",
+    "discount_value": 50,
+    "max_uses": -1,
+    "is_active": false,
+    "updated_at": "2026-03-07T12:30:00Z"
+  }
+}
+
+Status Codes:
+  200 — Coupon updated successfully.
+  401 — Unauthorized.
+  404 — Coupon not found.
+
+---
+
+### DELETE /coupons/delete
+**Delete Coupon**
+Permanently delete a coupon by its UUID. This cannot be undone.
+
+Parameters:
+  - id [string (UUID)] (required) — Coupon UUID
+
+Example (cURL):
+curl -X DELETE "https://dashboard.selldrop.io/api/v1/coupons/delete" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"id":"COUPON_UUID"}'
+
+Response:
+{
+  "success": true,
+  "deleted_id": "f1e2d3c4-b5a6-7890-bcde-f01234567892"
+}
+
+Status Codes:
+  200 — Coupon deleted successfully.
+  401 — Unauthorized.
+  404 — Coupon not found.
+
+---
+
+============================================================
+## Categories
+============================================================
+
+### GET /categories/list
+**List Categories**
+Returns a paginated list of all categories for your store. Categories are the top-level filter tabs displayed on your storefront (e.g. 'Tokens', 'Templates').
+
+Parameters:
+  - page [integer] (optional, default: 1) — Page number
+  - limit [integer] (optional, default: 20) — Results per page
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/categories/list?limit=10" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": [
+    {
+      "id": "f1e2d3c4-b5a6-7890-bcde-f01234567892",
+      "name": "Tokens",
+      "slug": "tokens",
+      "sort_priority": 10,
+      "created_at": "2026-03-21T08:00:00Z",
+      "updated_at": "2026-03-21T08:00:00Z"
+    }
+  ],
+  "meta": { "page": 1, "limit": 10, "total": 3, "pages": 1 }
+}
+
+Status Codes:
+  200 — Categories listed successfully.
+  401 — Unauthorized.
+
+---
+
+### GET /categories/get
+**Get Category**
+Retrieve a single category by UUID or slug.
+
+Parameters:
+  - id [string (UUID)] (optional) — Category UUID (provide id or slug)
+  - slug [string] (optional) — Category slug (provide id or slug)
+
+Example (cURL):
+curl "https://dashboard.selldrop.io/api/v1/categories/get?slug=tokens" \
+  -H "Authorization: Bearer <token>"
+
+Response:
+{
+  "data": {
+    "id": "f1e2d3c4-b5a6-7890-bcde-f01234567892",
+    "name": "Tokens",
+    "slug": "tokens",
+    "sort_priority": 10,
+    "created_at": "2026-03-21T08:00:00Z",
+    "updated_at": "2026-03-21T08:00:00Z"
+  }
+}
+
+Status Codes:
+  200 — Category retrieved.
+  400 — id or slug is required.
+  401 — Unauthorized.
+  404 — Category not found.
+
+---
+
+### POST /categories/create
+**Create Category**
+Create a new category. If slug is omitted, it is auto-generated from the name. Slugs must be unique per store.
+
+Parameters:
+  - name [string] (required) — Category name
+  - slug [string] (optional) — URL slug (auto-generated if omitted)
+  - sort_priority [integer] (optional, default: 0) — Display order (higher = first)
+
+Example (cURL):
+curl -X POST "https://dashboard.selldrop.io/api/v1/categories/create" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"name":"Tokens","sort_priority":10}'
+
+Response:
+{
+  "data": {
+    "id": "f1e2d3c4-b5a6-7890-bcde-f01234567892",
+    "name": "Tokens",
+    "slug": "tokens",
+    "sort_priority": 10,
+    "created_at": "2026-03-21T08:00:00Z"
+  }
+}
+
+Status Codes:
+  201 — Category created successfully.
+  400 — name is required.
+  401 — Unauthorized.
+  409 — Slug already exists in this store.
+
+---
+
+### PATCH /categories/update
+**Update Category**
+Update one or more fields on an existing category. Only provided fields are changed.
+
+Parameters:
+  - id [string (UUID)] (required) — Category UUID
+  - name [string] (optional) — Category name
+  - slug [string] (optional) — URL slug
+  - sort_priority [integer] (optional) — Display order (higher = first)
+
+Example (cURL):
+curl -X PATCH "https://dashboard.selldrop.io/api/v1/categories/update" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"id":"CATEGORY_UUID","name":"Premium Tokens"}'
+
+Response:
+{
+  "data": {
+    "id": "f1e2d3c4-b5a6-7890-bcde-f01234567892",
+    "name": "Premium Tokens",
+    "slug": "tokens",
+    "sort_priority": 10,
+    "updated_at": "2026-03-21T08:00:00Z"
+  }
+}
+
+Status Codes:
+  200 — Category updated.
+  400 — No fields to update or invalid values.
+  401 — Unauthorized.
+  404 — Category not found.
+  409 — Slug already exists in this store.
+
+---
+
+### DELETE /categories/delete
+**Delete Category**
+Permanently delete a category by UUID. Products assigned to this category will have their category_id set to null. This cannot be undone.
+
+Parameters:
+  - id [string (UUID)] (required) — Category UUID
+
+Example (cURL):
+curl -X DELETE "https://dashboard.selldrop.io/api/v1/categories/delete" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"id":"CATEGORY_UUID"}'
+
+Response:
+{
+  "success": true,
+  "deleted_id": "f1e2d3c4-b5a6-7890-bcde-f01234567892"
+}
+
+Status Codes:
+  200 — Category deleted.
+  401 — Unauthorized.
+  404 — Category not found.
+
+---
+
+============================================================
+## Ghosts
+============================================================
+
+### POST /ghost/create
+**Create Ghost Product**
+Create an ephemeral checkout embed. Only price is required — currency defaults to your store currency, delivery is optional. Omit delivery for a simple payment-only checkout (email + pay). Expires after 1 hour (crypto payments respected until confirmation).
+
+Parameters:
+  - price [integer] (required) — Price in smallest currency unit (e.g. cents). 4900 = $49.00
+  - currency [string] (optional) — Currency code, e.g. usd, eur, gbp. Defaults to your store currency
+  - name [string] (optional) — Product name
+  - description [string] (optional) — Product description
+  - image [string] (optional) — Image URL (copy from your store's Images section)
+  - delivery [string] (optional) — "dynamic" or "text". Omit for payment-only checkout (no delivery)
+  - callback_url [string] (optional) — Your endpoint called on order completion (required when delivery = "dynamic"). Must return JSON: { type: "serials", data: ["KEY-1"] } or { type: "text", data: "message" }
+  - delivery_text [string] (optional) — Static text shown after purchase (required when delivery = "text")
+  - min_quantity [integer] (optional, default: 1) — Minimum order quantity
+  - max_quantity [integer] (optional, default: 99999) — Maximum order quantity
+  - disabled_payment_methods [string[]] (optional) — Payment methods to block (e.g. stripe, paypal, crypto)
+
+Example (cURL):
+curl -X POST "https://dashboard.selldrop.io/api/v1/ghost/create" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"price":999}'
+
+Response:
+{
+  "data": {
+    "id": "d3f1a2b4-c5e6-4a7b-8c9d-0e1f2a3b4c5d",
+    "name": null,
+    "price": 999,
+    "currency": "usd",
+    "delivery": null,
+    "expires_at": "2026-01-15T13:00:00Z",
+    "embed_url": "https://selldrop.io/embed?product-id=d3f1a2b4-c5e6-4a7b-8c9d-0e1f2a3b4c5d",
+    "embed_html": {
+      "script_tag": "<script src=\"https://selldrop.io/embed.js\" defer></script>",
+      "button_tag": "<button data-selldrop-checkout=\"https://selldrop.io/embed?product-id=d3f1a2b4...\" ...>Buy Now</button>"
+    }
+  }
+}
+
+Status Codes:
+  201 — Ghost product created.
+  400 — Invalid parameters.
+  401 — Unauthorized.
+
+Note: Ghost products expire after 1 hour. If a customer sends a crypto payment before expiry, the product stays active until the payment confirms. Omit delivery for a simple payment-only checkout (just email + payment method). For dynamic delivery, your callback_url receives a POST with order data and must respond with JSON: { type: "serials"|"text", data: ... }. View active ghost products in Dashboard → Developers → Ghost Products.
+
+---
+
+
+## Error Codes
+200 OK — Success
+400 Bad Request — Missing or invalid fields
+401 Unauthorized — Missing or invalid API key
+403 Forbidden — IP not in allowlist
+404 Not Found — Resource not found
+409 Conflict — Duplicate entry (e.g. slug)
+429 Too Many Requests — Rate limit exceeded (120/min)
+500 Internal Server Error
