@@ -1,0 +1,1245 @@
+# ==================== PROFESSIONAL FOREX ANALYZER WITH SMC ====================
+class ForexAnalyzer:
+    """
+    Smart Money Concepts для Forex с многотаймфреймовым анализом
+    
+    🆕 УЛУЧШЕНИЯ (Feb 2026):
+    - BOS (Break of Structure) confirmation на M15
+    - Immediate momentum check перед входом
+    - Trailing stop management для защиты прибыли
+    - Ужесточенный начальный SL (ATR x2 вместо x4)
+    
+    Адаптировано из крипто-бота - профессиональная методология:
+    - Weekly levels (PWL/PWH)
+    - RSI divergence
+    - Daily rejection
+    - 4H fractal inducement
+    - StB/BtS манипуляции
+    - Liquidity pools
+    - Consolidation detection
+    - Multi-timeframe scoring
+    """
+
+    def __init__(self):
+        self.mt5 = None  # Будет передан позже
+
+    # ==================== БАЗОВЫЕ ИНДИКАТОРЫ ====================
+
+    def calculate_rsi(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate RSI"""
+        try:
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return rsi
+        except:
+            return pd.Series([50.0] * len(df))
+
+    def calculate_atr_pct(self, df: pd.DataFrame) -> float:
+        """Calculate ATR as percentage"""
+        try:
+            high = df['high']
+            low = df['low']
+            close = df['close']
+
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(window=14).mean().iloc[-1]
+
+            atr_pct = atr / close.iloc[-1]
+            return atr_pct
+        except Exception as e:
+            logger.error(f"ATR calculation error: {e}")
+            return 0.0
+
+    def calculate_atr_from_df(self, df: pd.DataFrame) -> float:
+        """🆕 Helper: Calculate raw ATR value (for trailing stop)"""
+        try:
+            high = df['high']
+            low = df['low']
+            close = df['close']
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(window=14).mean().iloc[-1]
+            return float(atr)
+        except:
+            return 0.0
+
+    def calculate_adx(self, df: pd.DataFrame, period: int = 14) -> float:
+        """Calculate ADX"""
+        try:
+            if len(df) < 50:
+                return 0.0
+
+            close = df['close']
+            high = df['high']
+            low = df['low']
+
+            high_diff = high.diff()
+            low_diff = -low.diff()
+
+            plus_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
+            minus_dm = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
+
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+            atr = tr.rolling(window=period).mean()
+            plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+            minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+
+            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+            adx = dx.rolling(window=period).mean().iloc[-1]
+
+            return adx
+        except Exception as e:
+            logger.error(f"ADX calculation error: {e}")
+            return 0.0
+
+    def detect_market_regime(self, df: pd.DataFrame) -> str:
+        """Detect if market is TRENDING or RANGING using ADX"""
+        try:
+            adx = self.calculate_adx(df, 14)
+
+            if adx > 25:
+                return 'TRENDING'
+            elif adx > 15:
+                return 'WEAK_TREND'
+            else:
+                return 'RANGING'
+        except Exception as e:
+            logger.error(f"Market regime detection error: {e}")
+            return 'UNKNOWN'
+
+    def detect_trend(self, df: pd.DataFrame) -> Tuple[str, float]:
+        """Detect trend using EMAs and measure price distance from EMA20"""
+        try:
+            if len(df) < 50:
+                return 'NEUTRAL', 0.0
+
+            ema_20 = df['close'].ewm(span=20, adjust=False).mean().iloc[-1]
+            ema_50 = df['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+            current_price = df['close'].iloc[-1]
+
+            distance_pct = abs(current_price - ema_20) / ema_20
+
+            if current_price > ema_20 and ema_20 > ema_50:
+                return 'BULLISH', distance_pct
+            if current_price < ema_20 and ema_20 < ema_50:
+                return 'BEARISH', distance_pct
+
+            return 'NEUTRAL', distance_pct
+        except Exception as e:
+            logger.error(f"Trend detection error: {e}")
+            return 'NEUTRAL', 0.0
+
+    # ==================== 🆕 BOS CONFIRMATION ====================
+
+    def confirm_bos_entry(self, df_15m: pd.DataFrame, direction: str) -> Tuple[bool, str]:
+        """
+        🆕 Break of Structure confirmation - вход ТОЛЬКО после подтверждения
+        
+        Для LONG:
+        - Цена пробила предыдущий хай
+        - Сформировался higher high
+        - Текущая свеча закрылась выше пробитого уровня
+        - Минимум 2 из 3 последних свечей бычьи
+        
+        Для SHORT:
+        - Цена пробила предыдущий лоу
+        - Сформировался lower low
+        - Текущая свеча закрылась ниже пробитого уровня
+        - Минимум 2 из 3 последних свечей медвежьи
+        """
+        try:
+            if len(df_15m) < 20:
+                return False, "Not enough data"
+            
+            recent = df_15m.iloc[-15:].copy()
+            
+            if direction == 'LONG':
+                # Найти последние swing highs
+                swing_highs = []
+                for i in range(2, len(recent) - 1):
+                    if (recent.iloc[i]['high'] > recent.iloc[i-1]['high'] and 
+                        recent.iloc[i]['high'] > recent.iloc[i-2]['high'] and
+                        recent.iloc[i]['high'] > recent.iloc[i+1]['high']):
+                        swing_highs.append((i, recent.iloc[i]['high']))
+                
+                if len(swing_highs) < 2:
+                    return False, "No swing structure"
+                
+                # Последний хай должен быть выше предыдущего (Higher High)
+                prev_high = swing_highs[-2][1]
+                last_high = swing_highs[-1][1]
+                current_close = recent.iloc[-1]['close']
+                
+                # BOS = текущая цена ВЫШЕ предыдущего хая
+                if current_close > prev_high and last_high > prev_high:
+                    # Проверка momentum: последние 2-3 свечи бычьи
+                    last_3_candles = recent.iloc[-3:]['close'] - recent.iloc[-3:]['open']
+                    bullish_candles = (last_3_candles > 0).sum()
+                    
+                    if bullish_candles >= 2:
+                        return True, f"BOS HH {last_high:.5f} > {prev_high:.5f}"
+                    else:
+                        return False, "BOS but weak candles"
+                
+                return False, f"No BOS: {current_close:.5f} < {prev_high:.5f}"
+            
+            else:  # SHORT
+                # Найти последние swing lows
+                swing_lows = []
+                for i in range(2, len(recent) - 1):
+                    if (recent.iloc[i]['low'] < recent.iloc[i-1]['low'] and 
+                        recent.iloc[i]['low'] < recent.iloc[i-2]['low'] and
+                        recent.iloc[i]['low'] < recent.iloc[i+1]['low']):
+                        swing_lows.append((i, recent.iloc[i]['low']))
+                
+                if len(swing_lows) < 2:
+                    return False, "No swing structure"
+                
+                prev_low = swing_lows[-2][1]
+                last_low = swing_lows[-1][1]
+                current_close = recent.iloc[-1]['close']
+                
+                # BOS = текущая цена НИЖЕ предыдущего лоу
+                if current_close < prev_low and last_low < prev_low:
+                    last_3_candles = recent.iloc[-3:]['close'] - recent.iloc[-3:]['open']
+                    bearish_candles = (last_3_candles < 0).sum()
+                    
+                    if bearish_candles >= 2:
+                        return True, f"BOS LL {last_low:.5f} < {prev_low:.5f}"
+                    else:
+                        return False, "BOS but weak candles"
+                
+                return False, f"No BOS: {current_close:.5f} > {prev_low:.5f}"
+        
+        except Exception as e:
+            logger.error(f"BOS confirmation error: {e}")
+            return False, str(e)
+
+    # ==================== 🆕 IMMEDIATE MOMENTUM CHECK ====================
+
+    def check_immediate_momentum(self, df_15m: pd.DataFrame, direction: str) -> Tuple[bool, float]:
+        """
+        🆕 Проверка импульса ПРЯМО СЕЙЧАС
+        
+        - Последние 3 свечи должны идти в направлении сигнала (минимум 2 из 3)
+        - RSI должен показывать momentum (но не перекупленность/перепроданность)
+        - Объем должен быть выше среднего (минимум 1.2x)
+        - Body свечей должен быть > 40% от range (не пины)
+        """
+        try:
+            if len(df_15m) < 20:
+                return False, 0.0
+            
+            # 1. Свечной анализ (последние 3 свечи)
+            last_3 = df_15m.iloc[-3:].copy()
+            
+            if direction == 'LONG':
+                # Последние 3 свечи должны быть преимущественно бычьи
+                bullish = (last_3['close'] > last_3['open']).sum()
+                body_size = (last_3['close'] - last_3['open']).abs().mean()
+                candle_range = (last_3['high'] - last_3['low']).mean()
+                
+                if bullish < 2:
+                    return False, 0.0
+                
+                # Body должен быть > 40% от range (strong momentum)
+                if candle_range > 0 and body_size < candle_range * 0.4:
+                    return False, 0.0
+                
+                direction_count = bullish
+            
+            else:  # SHORT
+                bearish = (last_3['close'] < last_3['open']).sum()
+                body_size = (last_3['close'] - last_3['open']).abs().mean()
+                candle_range = (last_3['high'] - last_3['low']).mean()
+                
+                if bearish < 2:
+                    return False, 0.0
+                
+                if candle_range > 0 and body_size < candle_range * 0.4:
+                    return False, 0.0
+                
+                direction_count = bearish
+            
+            # 2. RSI momentum (не перекупленность!)
+            rsi = self.calculate_rsi(df_15m, 14).iloc[-1]
+            
+            if direction == 'LONG':
+                # RSI должен быть 45-75 (есть импульс, но не overbought)
+                if not (45 < rsi < 75):
+                    return False, 0.0
+            else:
+                # RSI должен быть 25-55
+                if not (25 < rsi < 55):
+                    return False, 0.0
+            
+            # 3. Объем
+            current_volume = df_15m['tick_volume'].iloc[-1]
+            avg_volume = df_15m['tick_volume'].iloc[-20:-1].mean()
+            
+            if avg_volume == 0:
+                volume_ratio = 1.0
+            else:
+                volume_ratio = current_volume / avg_volume
+            
+            if volume_ratio < 1.2:  # Минимум 1.2x объем
+                return False, 0.0
+            
+            # Momentum score (0-100)
+            momentum_score = min(100, direction_count * 25 + volume_ratio * 15)
+            
+            return True, momentum_score
+        
+        except Exception as e:
+            logger.error(f"Momentum check error: {e}")
+            return False, 0.0
+
+    # ==================== 🆕 TRAILING STOP MANAGEMENT ====================
+
+    def manage_trailing_stop(self, ticket: int, position: Dict, df_15m: pd.DataFrame) -> bool:
+        """
+        🆕 Динамический trailing stop после движения в прибыль
+        
+        Логика (3 уровня защиты):
+        - Если профит > 0.3% → переводим в breakeven
+        - Если профит > 0.6% → trailing stop на ATR x1.5 от текущей цены
+        - Если профит > 1.0% → trailing stop на ATR x1.0 (очень плотно)
+        """
+        try:
+            current_price = position['current_price']
+            entry_price = position['open_price']
+            direction = position['type']
+            current_sl = position['sl']
+            
+            # Расчет текущей прибыли в %
+            if direction == 'BUY':
+                profit_pct = (current_price - entry_price) / entry_price
+            else:
+                profit_pct = (entry_price - current_price) / entry_price
+            
+            logger.info(f"[TRAILING SL] Ticket #{ticket} | Profit: {profit_pct*100:.2f}%")
+            
+            # ATR для расчета дистанции
+            atr = self.calculate_atr_from_df(df_15m)
+            if atr == 0:
+                logger.warning(f"  Cannot calculate ATR - skipping")
+                return False
+            
+            new_sl = None
+            
+            # Level 1: Breakeven (0.3% profit)
+            if profit_pct > 0.003:
+                if direction == 'BUY':
+                    if current_sl < entry_price:
+                        new_sl = entry_price + 0.0001  # Чуть выше breakeven
+                        logger.info(f"  → Moving to BREAKEVEN: {new_sl:.5f}")
+                else:
+                    if current_sl > entry_price:
+                        new_sl = entry_price - 0.0001
+                        logger.info(f"  → Moving to BREAKEVEN: {new_sl:.5f}")
+            
+            # Level 2: Tight trailing (0.6% profit)
+            if profit_pct > 0.006:
+                if direction == 'BUY':
+                    tight_sl = current_price - (atr * 1.5)
+                    if tight_sl > current_sl:
+                        new_sl = tight_sl
+                        logger.info(f"  → TIGHT TRAILING: {new_sl:.5f} (ATR x1.5)")
+                else:
+                    tight_sl = current_price + (atr * 1.5)
+                    if tight_sl < current_sl:
+                        new_sl = tight_sl
+                        logger.info(f"  → TIGHT TRAILING: {new_sl:.5f} (ATR x1.5)")
+            
+            # Level 3: Very tight trailing (1.0% profit)
+            if profit_pct > 0.010:
+                if direction == 'BUY':
+                    very_tight_sl = current_price - (atr * 1.0)
+                    if very_tight_sl > current_sl:
+                        new_sl = very_tight_sl
+                        logger.info(f"  → VERY TIGHT TRAILING: {new_sl:.5f} (ATR x1.0)")
+                else:
+                    very_tight_sl = current_price + (atr * 1.0)
+                    if very_tight_sl < current_sl:
+                        new_sl = very_tight_sl
+                        logger.info(f"  → VERY TIGHT TRAILING: {new_sl:.5f} (ATR x1.0)")
+            
+            # Применить новый SL
+            if new_sl and new_sl != current_sl:
+                success = self.mt5.modify_sl_tp(ticket, new_sl)
+                if success:
+                    logger.info(f"[OK] Trailing SL updated: #{ticket} → {new_sl:.5f}")
+                    return True
+            
+            return False
+        
+        except Exception as e:
+            logger.error(f"Trailing stop error: {e}")
+            return False
+
+    # ==================== WEEKLY LEVELS (SMC) ====================
+
+    def get_weekly_levels(self, df: pd.DataFrame) -> Optional[Dict]:
+        """
+        Получить уровни предыдущей недели (PWL/PWH) и week open
+        Для анализа: rejection от PWH, тест PWL, синхрон с week open
+        """
+        try:
+            # Преобразуем в недельные свечи
+            df_weekly = df.copy()
+            df_weekly = df_weekly.set_index('time')
+            df_weekly = df_weekly.resample('W').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'tick_volume': 'sum'
+            }).dropna()
+
+            if len(df_weekly) < 2:
+                return None
+
+            prev_week = df_weekly.iloc[-2]
+            current_week = df_weekly.iloc[-1]
+
+            return {
+                'pwh': float(prev_week['high']),  # Previous Week High
+                'pwl': float(prev_week['low']),   # Previous Week Low
+                'pw_open': float(prev_week['open']),
+                'pw_close': float(prev_week['close']),
+                'week_open': float(current_week['open']),  # Current Week Open
+                'week_high': float(current_week['high']),
+                'week_low': float(current_week['low'])
+            }
+        except Exception as e:
+            logger.error(f"[WEEKLY LEVELS] Error: {e}")
+            return None
+
+    # ==================== RSI DIVERGENCE ====================
+
+    def detect_rsi_divergence(self, df: pd.DataFrame, rsi_period: int = 14) -> Optional[Dict]:
+        """
+        Детектирование RSI дивергенции — мощный сигнал разворота.
+        Bullish : цена делает lower low,  RSI делает higher low
+        Bearish : цена делает higher high, RSI делает lower high
+
+        🔧 FIX: Добавлена категория WEAK (шум) — diff < 3.5 полностью игнорируется.
+        Порог:
+        STRONG   = diff > 8.0   (+30 очков в _check_divergence)
+        MODERATE = diff > 3.5   (+20 очков)
+        WEAK     = diff ≤ 3.5   → return None  ← было: MODERATE с diff 1.6 давало +20!
+        """
+        if len(df) < 20:
+            return None
+
+        try:
+            rsi        = self.calculate_rsi(df, rsi_period)
+            recent     = df.iloc[-15:].copy()
+            rsi_recent = rsi.iloc[-15:]
+
+            # ── Bullish Divergence ────────────────────────────────────────
+            price_lows_indices = []
+            for i in range(2, len(recent) - 2):
+                if (recent.iloc[i]['low'] < recent.iloc[i-1]['low'] and
+                        recent.iloc[i]['low'] < recent.iloc[i+1]['low']):
+                    price_lows_indices.append(i)
+
+            if len(price_lows_indices) >= 2:
+                last_two_lows = price_lows_indices[-2:]
+                price_low_1   = recent.iloc[last_two_lows[0]]['low']
+                price_low_2   = recent.iloc[last_two_lows[1]]['low']
+                rsi_low_1     = rsi_recent.iloc[last_two_lows[0]]
+                rsi_low_2     = rsi_recent.iloc[last_two_lows[1]]
+
+                if price_low_2 < price_low_1 and rsi_low_2 > rsi_low_1:
+                    diff = rsi_low_2 - rsi_low_1
+
+                    # 🔧 FIX: всё что ниже 3.5 — статистический шум, не возвращаем
+                    if diff >= 3.5:
+                        strength = 'STRONG' if diff > 8.0 else 'MODERATE'
+                        return {
+                            'type':        'BULLISH_DIVERGENCE',
+                            'strength':    strength,
+                            'rsi_diff':    float(diff),
+                            'price_low_1': float(price_low_1),
+                            'price_low_2': float(price_low_2),
+                        }
+
+            # ── Bearish Divergence ────────────────────────────────────────
+            price_highs_indices = []
+            for i in range(2, len(recent) - 2):
+                if (recent.iloc[i]['high'] > recent.iloc[i-1]['high'] and
+                        recent.iloc[i]['high'] > recent.iloc[i+1]['high']):
+                    price_highs_indices.append(i)
+
+            if len(price_highs_indices) >= 2:
+                last_two_highs = price_highs_indices[-2:]
+                price_high_1   = recent.iloc[last_two_highs[0]]['high']
+                price_high_2   = recent.iloc[last_two_highs[1]]['high']
+                rsi_high_1     = rsi_recent.iloc[last_two_highs[0]]
+                rsi_high_2     = rsi_recent.iloc[last_two_highs[1]]
+
+                if price_high_2 > price_high_1 and rsi_high_2 < rsi_high_1:
+                    diff = rsi_high_1 - rsi_high_2
+
+                    # 🔧 FIX: всё что ниже 3.5 — шум
+                    if diff >= 3.5:
+                        strength = 'STRONG' if diff > 8.0 else 'MODERATE'
+                        return {
+                            'type':         'BEARISH_DIVERGENCE',
+                            'strength':     strength,
+                            'rsi_diff':     float(diff),
+                            'price_high_1': float(price_high_1),
+                            'price_high_2': float(price_high_2),
+                        }
+
+            return None
+
+        except Exception as e:
+            logger.error(f"[RSI DIVERGENCE] Error: {e}")
+            return None
+    # ==================== DAILY REJECTION ====================
+
+    def detect_daily_rejection(self, df_daily: pd.DataFrame, key_level: float) -> Optional[Dict]:
+        """
+        Детект rejection от ключевого уровня на дневном TF
+        Rejection = длинный wick + закрытие далеко от экстремума
+        """
+        if len(df_daily) < 3:
+            return None
+
+        try:
+            current = df_daily.iloc[-1]
+
+            # Bearish Rejection (от верха)
+            upper_wick = current['high'] - max(current['close'], current['open'])
+            body_size = abs(current['close'] - current['open'])
+
+            if upper_wick > body_size * 2:  # Wick в 2 раза больше тела
+                if abs(current['high'] - key_level) / key_level < 0.01:  # В пределах 1% от уровня
+                    return {
+                        'type': 'BEARISH_REJECTION',
+                        'level': key_level,
+                        'wick_pct': float((upper_wick / current['close']) * 100),
+                        'strength': 'STRONG' if upper_wick > body_size * 3 else 'MODERATE'
+                    }
+
+            # Bullish Rejection (от низа)
+            lower_wick = min(current['close'], current['open']) - current['low']
+
+            if lower_wick > body_size * 2:
+                if abs(current['low'] - key_level) / key_level < 0.01:
+                    return {
+                        'type': 'BULLISH_REJECTION',
+                        'level': key_level,
+                        'wick_pct': float((lower_wick / current['close']) * 100),
+                        'strength': 'STRONG' if lower_wick > body_size * 3 else 'MODERATE'
+                    }
+
+            return None
+        except Exception as e:
+            logger.error(f"[DAILY REJECTION] Error: {e}")
+            return None
+
+    # ==================== 4H FRACTAL DETECTION ====================
+
+    def detect_4h_fractal(self, df_4h: pd.DataFrame, lookback: int = 20) -> Optional[Dict]:
+        """
+        Детект 4-часовых фракталов (swing high/low на 4H)
+        Используется для определения ключевых уровней - inducement
+        """
+        if len(df_4h) < lookback:
+            return None
+
+        try:
+            recent = df_4h.iloc[-lookback:]
+
+            # Find fractal highs (5-candle pattern)
+            fractal_highs = []
+            for i in range(2, len(recent) - 2):
+                if (recent.iloc[i]['high'] > recent.iloc[i-1]['high'] and
+                    recent.iloc[i]['high'] > recent.iloc[i-2]['high'] and
+                    recent.iloc[i]['high'] > recent.iloc[i+1]['high'] and
+                    recent.iloc[i]['high'] > recent.iloc[i+2]['high']):
+                    fractal_highs.append({
+                        'price': float(recent.iloc[i]['high']),
+                        'index': i
+                    })
+
+            # Find fractal lows
+            fractal_lows = []
+            for i in range(2, len(recent) - 2):
+                if (recent.iloc[i]['low'] < recent.iloc[i-1]['low'] and
+                    recent.iloc[i]['low'] < recent.iloc[i-2]['low'] and
+                    recent.iloc[i]['low'] < recent.iloc[i+1]['low'] and
+                    recent.iloc[i]['low'] < recent.iloc[i+2]['low']):
+                    fractal_lows.append({
+                        'price': float(recent.iloc[i]['low']),
+                        'index': i
+                    })
+
+            current_price = float(df_4h.iloc[-1]['close'])
+
+            # Ближайший фрактал сверху
+            nearest_fractal_high = None
+            if fractal_highs:
+                nearest_fractal_high = min(fractal_highs, key=lambda x: abs(x['price'] - current_price))
+
+            # Ближайший фрактал снизу
+            nearest_fractal_low = None
+            if fractal_lows:
+                nearest_fractal_low = min(fractal_lows, key=lambda x: abs(x['price'] - current_price))
+
+            return {
+                'fractal_high': nearest_fractal_high['price'] if nearest_fractal_high else None,
+                'fractal_low': nearest_fractal_low['price'] if nearest_fractal_low else None,
+                'current_price': current_price,
+                'high_distance_pct': ((nearest_fractal_high['price'] - current_price) / current_price * 100) if nearest_fractal_high else None,
+                'low_distance_pct': ((current_price - nearest_fractal_low['price']) / current_price * 100) if nearest_fractal_low else None,
+                'all_highs': [f['price'] for f in fractal_highs],
+                'all_lows': [f['price'] for f in fractal_lows]
+            }
+        except Exception as e:
+            logger.error(f"[4H FRACTAL] Error: {e}")
+            return None
+
+    # ==================== StB/BtS MANIPULATION ====================
+
+    def detect_stb_manipulation(self, df: pd.DataFrame) -> Optional[Dict]:
+        """
+        Детект StB (Sell to Buy) манипуляции
+        Цена сначала выбивает стопы вниз, затем резко идет вверх (и наоборот)
+        """
+        if len(df) < 10:
+            return None
+
+        try:
+            recent = df.iloc[-10:]
+            current = recent.iloc[-1]
+            prev_5 = recent.iloc[-6:-1]  # Предыдущие 5 свечей
+
+            # Bullish StB: сначала fake breakdown, потом резкий рост
+            recent_low_before = prev_5['low'].min()
+            stop_hunt_happened = current['low'] < recent_low_before * 0.998  # Пробили минимум
+            strong_reversal = current['close'] > recent_low_before * 1.005  # Закрылись выше
+
+            if stop_hunt_happened and strong_reversal:
+                wick_size = min(current['close'], current['open']) - current['low']
+                body_size = abs(current['close'] - current['open'])
+
+                # Длинный нижний wick = признак absorption
+                if wick_size > body_size * 0.5:
+                    return {
+                        'type': 'BULLISH_STB',
+                        'stop_hunt_level': float(current['low']),
+                        'reversal_close': float(current['close']),
+                        'wick_pct': float((wick_size / current['close']) * 100),
+                        'volume_ratio': float(current['tick_volume'] / prev_5['tick_volume'].mean()),
+                        'strength': 'STRONG' if wick_size > body_size else 'MODERATE'
+                    }
+
+            # Bearish StB: сначала fake breakout, потом резкий dump
+            recent_high_before = prev_5['high'].max()
+            stop_hunt_happened = current['high'] > recent_high_before * 1.002
+            strong_reversal = current['close'] < recent_high_before * 0.995
+
+            if stop_hunt_happened and strong_reversal:
+                wick_size = current['high'] - max(current['close'], current['open'])
+                body_size = abs(current['close'] - current['open'])
+
+                if wick_size > body_size * 0.5:
+                    return {
+                        'type': 'BEARISH_STB',
+                        'stop_hunt_level': float(current['high']),
+                        'reversal_close': float(current['close']),
+                        'wick_pct': float((wick_size / current['close']) * 100),
+                        'volume_ratio': float(current['tick_volume'] / prev_5['tick_volume'].mean()),
+                        'strength': 'STRONG' if wick_size > body_size else 'MODERATE'
+                    }
+
+            return None
+        except Exception as e:
+            logger.error(f"[STB MANIPULATION] Error: {e}")
+            return None
+
+    # ==================== INDUCEMENT ZONE ====================
+
+    def check_inducement_zone(self, df: pd.DataFrame, df_4h: pd.DataFrame) -> Optional[Dict]:
+        """
+        Проверка inducement (заманивание) - подготовленная ловушка
+        Это зона, куда хотят заманить трейдеров перед реальным движением
+        """
+        if len(df) < 50 or len(df_4h) < 20:
+            return None
+
+        try:
+            # Получаем 4H фракталы
+            fractal_4h = self.detect_4h_fractal(df_4h, 20)
+            if not fractal_4h:
+                return None
+
+            current_price = float(df.iloc[-1]['close'])
+
+            # Inducement выше (bearish trap)
+            if fractal_4h['fractal_high']:
+                distance_pct = ((fractal_4h['fractal_high'] - current_price) / current_price) * 100
+
+                # Если фрактал близко (0.5-2%)
+                if 0.5 < distance_pct < 2.0:
+                    # Проверяем, есть ли признаки манипуляции
+                    liquidity_pools = self.detect_liquidity_pools(df, 50)
+                    has_liquidity_above = any(lp['side'] == 'ABOVE' and lp['distance_pct'] < 2 for lp in liquidity_pools)
+
+                    if has_liquidity_above:
+                        return {
+                            'type': 'BEARISH_INDUCEMENT',
+                            'inducement_level': fractal_4h['fractal_high'],
+                            'current_price': current_price,
+                            'distance_pct': distance_pct,
+                            'scenario': 'Price may sweep liquidity above, then reverse DOWN',
+                            'action': 'Wait for rejection from inducement level'
+                        }
+
+            # Inducement ниже (bullish trap)
+            if fractal_4h['fractal_low']:
+                distance_pct = ((current_price - fractal_4h['fractal_low']) / current_price) * 100
+
+                if 0.5 < distance_pct < 2.0:
+                    liquidity_pools = self.detect_liquidity_pools(df, 50)
+                    has_liquidity_below = any(lp['side'] == 'BELOW' and lp['distance_pct'] < 2 for lp in liquidity_pools)
+
+                    if has_liquidity_below:
+                        return {
+                            'type': 'BULLISH_INDUCEMENT',
+                            'inducement_level': fractal_4h['fractal_low'],
+                            'current_price': current_price,
+                            'distance_pct': distance_pct,
+                            'scenario': 'Price may sweep liquidity below, then reverse UP',
+                            'action': 'Wait for bounce from inducement level'
+                        }
+
+            return None
+        except Exception as e:
+            logger.error(f"[INDUCEMENT ZONE] Error: {e}")
+            return None
+
+    # ==================== LIQUIDITY POOLS ====================
+
+    def detect_liquidity_pools(self, df: pd.DataFrame, lookback: int = 50) -> List[Dict]:
+        """
+        Detect liquidity pools - зоны скопления ликвидности (стопы)
+        """
+        if len(df) < lookback:
+            return []
+
+        try:
+            recent = df.iloc[-lookback:]
+            current_price = float(df.iloc[-1]['close'])
+            liquidity_zones = []
+
+            # Находим кластеры хаев
+            highs = []
+            for i in range(5, len(recent) - 5):
+                if (recent.iloc[i]['high'] > recent.iloc[i-1]['high'] and
+                    recent.iloc[i]['high'] > recent.iloc[i+1]['high']):
+                    highs.append(float(recent.iloc[i]['high']))
+
+            # Находим кластеры лоев
+            lows = []
+            for i in range(5, len(recent) - 5):
+                if (recent.iloc[i]['low'] < recent.iloc[i-1]['low'] and
+                    recent.iloc[i]['low'] < recent.iloc[i+1]['low']):
+                    lows.append(float(recent.iloc[i]['low']))
+
+            # Кластеризуем хаи (если несколько уровней близко - это ликвидность)
+            if len(highs) > 0:
+                highs_sorted = sorted(highs, reverse=True)
+                clustered_highs = []
+                for high in highs_sorted[:5]:
+                    similar_count = sum(1 for h in highs if abs(h - high) / high < 0.005)
+                    if similar_count >= 2:
+                        clustered_highs.append(high)
+
+                seen = set()
+                for high in clustered_highs:
+                    if high not in seen and high > current_price:
+                        liquidity_zones.append({
+                            'type': 'RESISTANCE_LIQUIDITY',
+                            'price': high,
+                            'distance_pct': ((high - current_price) / current_price) * 100,
+                            'side': 'ABOVE',
+                            'likely_action': 'LIQUIDITY_GRAB_THEN_REVERSAL'
+                        })
+                        seen.add(high)
+
+            # Кластеризуем лои
+            if len(lows) > 0:
+                lows_sorted = sorted(lows)
+                clustered_lows = []
+                for low in lows_sorted[:5]:
+                    similar_count = sum(1 for l in lows if abs(l - low) / low < 0.005)
+                    if similar_count >= 2:
+                        clustered_lows.append(low)
+
+                seen = set()
+                for low in clustered_lows:
+                    if low not in seen and low < current_price:
+                        liquidity_zones.append({
+                            'type': 'SUPPORT_LIQUIDITY',
+                            'price': low,
+                            'distance_pct': ((current_price - low) / current_price) * 100,
+                            'side': 'BELOW',
+                            'likely_action': 'LIQUIDITY_GRAB_THEN_REVERSAL'
+                        })
+                        seen.add(low)
+
+            # Сортируем по близости
+            liquidity_zones.sort(key=lambda x: abs(x['distance_pct']))
+            return liquidity_zones[:3]  # Топ-3 ближайших
+        except Exception as e:
+            logger.error(f"[LIQUIDITY POOLS] Error: {e}")
+            return []
+
+    # ==================== 🔥 ГЛАВНЫЙ АНАЛИЗ С BOS + MOMENTUM ====================
+
+    def analyze_signal_smc(self, symbol: str, broker_symbol: str, mt5_connector) -> Dict:
+        """🔥 ПРОФЕССИОНАЛЬНЫЙ АНАЛИЗ С SMC + BOS + MOMENTUM ФИЛЬТРАМИ"""
+        try:
+            self.mt5 = mt5_connector
+
+            # ==================== SESSION CHECK ====================
+            session_info = SessionFilter.get_current_session()
+            logger.info(f"\n[SESSION CHECK]")
+            logger.info(f"  Current session: {session_info['session']}")
+            logger.info(f"  Active: {session_info['active']}")
+            logger.info(f"  Score modifier: {session_info['score_modifier']:+d}")
+            logger.info(f"  {session_info['description']}")
+            
+            # 🚫 HARD BLOCK: неактивная сессия
+            if Config.ONLY_ACTIVE_SESSIONS and not session_info['active']:
+                logger.warning(f"  [BLOCKED] Trading disabled - {session_info['description']}")
+                return {
+                    'score': 0,
+                    'signal': 'NONE',
+                    'reason': f"Inactive session: {session_info['session']}",
+                    'symbol': symbol
+                }
+
+            # ==================== GET DATA ====================
+            df_daily = self.mt5.get_ohlcv(broker_symbol, "D1", 200)
+            df_4h = self.mt5.get_ohlcv(broker_symbol, "H4", 200)
+            df_1h = self.mt5.get_ohlcv(broker_symbol, "H1", 500)
+            df_15m = self.mt5.get_ohlcv(broker_symbol, "M15", 500)
+
+            if df_daily.empty or df_4h.empty or df_1h.empty or df_15m.empty:
+                return {
+                    'score': 0,
+                    'signal': 'NONE',
+                    'reason': 'Insufficient data',
+                    'symbol': symbol
+                }
+
+            score = 0
+            signals = []
+            warnings = []
+            current_price = float(df_15m['close'].iloc[-1])
+
+            logger.info(f"\n{'='*60}")
+            logger.info(f"[SMC ANALYSIS] {symbol} @ ${current_price:.5f}")
+            logger.info(f"{'='*60}")
+
+            # Применяем модификатор сессии
+            score += session_info['score_modifier']
+            if session_info['score_modifier'] > 0:
+                signals.append(session_info['description'])
+                logger.info(f"  [{session_info['score_modifier']:+d}] {session_info['description']}")
+            elif session_info['score_modifier'] < 0:
+                warnings.append(session_info['description'])
+                logger.warning(f"  [{session_info['score_modifier']:+d}] {session_info['description']}")
+
+            # ==================== VOLUME HARD BLOCK ====================
+            volume_ok, volume_ratio = SessionFilter.check_volume_confirmation(df_15m, Config.MIN_VOLUME_RATIO)
+            logger.info(f"\n[VOLUME CHECK]")
+            logger.info(f"  Volume ratio: {volume_ratio:.2f}x")
+            logger.info(f"  Required: {Config.MIN_VOLUME_RATIO}x")
+            
+            if not volume_ok:
+                warnings.append(f"⚠️ Low volume: {volume_ratio:.2f}x < {Config.MIN_VOLUME_RATIO}x")
+                logger.warning(f"  [BLOCKED] Volume too low - REJECTING SIGNAL")
+                return {
+                    'score': 0,
+                    'signal': 'NONE',
+                    'reason': f'Low volume: {volume_ratio:.2f}x < {Config.MIN_VOLUME_RATIO}x',
+                    'symbol': symbol,
+                    'volume_ratio': volume_ratio
+                }
+            
+            # Volume OK - продолжаем
+            score += 15
+            signals.append(f"✅ High volume ({volume_ratio:.2f}x)")
+            logger.info(f"  [+15] Volume confirmed")
+
+            # ==================== WEEKLY LEVELS ====================
+            weekly_levels = self.get_weekly_levels(df_daily)
+            if weekly_levels:
+                pwh = weekly_levels['pwh']
+                pwl = weekly_levels['pwl']
+                wop = weekly_levels['week_open']
+
+                logger.info(f"\n[WEEKLY LEVELS]")
+                logger.info(f"  PWH: ${pwh:.5f} ({((pwh - current_price)/current_price*100):.2f}% above)")
+                logger.info(f"  PWL: ${pwl:.5f} ({((current_price - pwl)/current_price*100):.2f}% below)")
+                logger.info(f"  WOP: ${wop:.5f}")
+
+                # Price near PWL (bullish setup)
+                distance_to_pwl = abs(current_price - pwl) / pwl
+                if distance_to_pwl < 0.01:
+                    score += 30
+                    signals.append("🔥 Price AT PWL - high probability bounce")
+                    logger.info(f"  [+30] Price at PWL")
+                elif distance_to_pwl < 0.02:
+                    score += 15
+                    signals.append("✅ Price near PWL")
+                    logger.info(f"  [+15] Price near PWL")
+
+                # Price near PWH (bearish setup)
+                distance_to_pwh = abs(current_price - pwh) / pwh
+                if distance_to_pwh < 0.01:
+                    score += 30
+                    signals.append("🔥 Price AT PWH - high probability rejection")
+                    logger.info(f"  [+30] Price at PWH")
+                elif distance_to_pwh < 0.02:
+                    score += 15
+                    signals.append("✅ Price near PWH")
+                    logger.info(f"  [+15] Price near PWH")
+
+                # WOP sync
+                distance_to_wop = abs(current_price - wop) / wop
+                if distance_to_wop < 0.005:
+                    score += 10
+                    signals.append("✅ WOP synchronization")
+                    logger.info(f"  [+10] Price at Week Open")
+
+            # ==================== DAILY REJECTION ====================
+            if weekly_levels:
+                daily_rejection = self.detect_daily_rejection(df_daily, pwh)
+                if not daily_rejection:
+                    daily_rejection = self.detect_daily_rejection(df_daily, pwl)
+
+                if daily_rejection:
+                    logger.info(f"\n[DAILY REJECTION]")
+                    logger.info(f"  Type: {daily_rejection['type']}")
+                    logger.info(f"  Wick: {daily_rejection['wick_pct']:.2f}%")
+                    logger.info(f"  Strength: {daily_rejection['strength']}")
+
+                    if daily_rejection['strength'] == 'STRONG':
+                        score += 25
+                        signals.append(f"🔥 STRONG {daily_rejection['type']}")
+                        logger.info(f"  [+25] Strong rejection")
+                    else:
+                        score += 15
+                        signals.append(f"✅ {daily_rejection['type']}")
+                        logger.info(f"  [+15] Moderate rejection")
+
+            # ==================== RSI DIVERGENCE ====================
+            rsi_div = self.detect_rsi_divergence(df_1h, 14)
+            if rsi_div:
+                logger.info(f"\n[RSI DIVERGENCE]")
+                logger.info(f"  Type: {rsi_div['type']}")
+                logger.info(f"  Strength: {rsi_div['strength']}")
+                logger.info(f"  RSI diff: {rsi_div['rsi_diff']:.1f}")
+
+                if rsi_div['strength'] == 'STRONG':
+                    score += 20
+                    signals.append(f"🔥 STRONG {rsi_div['type']}")
+                    logger.info(f"  [+20] Strong divergence")
+                else:
+                    score += 10
+                    signals.append(f"✅ {rsi_div['type']}")
+                    logger.info(f"  [+10] Moderate divergence")
+
+            # ==================== 4H FRACTAL INDUCEMENT ====================
+            inducement = self.check_inducement_zone(df_15m, df_4h)
+            if inducement:
+                logger.info(f"\n[INDUCEMENT ZONE]")
+                logger.info(f"  Type: {inducement['type']}")
+                logger.info(f"  Level: ${inducement['inducement_level']:.5f}")
+                logger.info(f"  Distance: {inducement['distance_pct']:.2f}%")
+                logger.info(f"  Scenario: {inducement['scenario']}")
+
+                score += 15
+                signals.append(f"✅ {inducement['type']} detected")
+                logger.info(f"  [+15] Inducement zone")
+
+            # ==================== StB MANIPULATION ====================
+            stb_manip = self.detect_stb_manipulation(df_15m)
+            if stb_manip:
+                logger.info(f"\n[StB MANIPULATION]")
+                logger.info(f"  Type: {stb_manip['type']}")
+                logger.info(f"  Strength: {stb_manip['strength']}")
+                logger.info(f"  Wick: {stb_manip['wick_pct']:.2f}%")
+                logger.info(f"  Volume ratio: {stb_manip['volume_ratio']:.2f}x")
+
+                if stb_manip['strength'] == 'STRONG':
+                    score += 20
+                    signals.append(f"🔥 STRONG {stb_manip['type']}")
+                    logger.info(f"  [+20] Strong manipulation")
+                else:
+                    score += 10
+                    signals.append(f"✅ {stb_manip['type']}")
+                    logger.info(f"  [+10] Moderate manipulation")
+
+            # ==================== LIQUIDITY POOLS ====================
+            liquidity_pools = self.detect_liquidity_pools(df_15m, 50)
+            if liquidity_pools:
+                logger.info(f"\n[LIQUIDITY POOLS]")
+                for lp in liquidity_pools[:2]:
+                    logger.info(f"  {lp['type']}: ${lp['price']:.5f} ({lp['distance_pct']:.2f}% {lp['side']})")
+
+                nearest_lp = liquidity_pools[0]
+                if nearest_lp['distance_pct'] < 0.5:
+                    score += 15
+                    signals.append(f"🔥 AT liquidity pool - expect grab + reversal")
+                    logger.info(f"  [+15] Near liquidity pool")
+
+            # ==================== TREND ALIGNMENT ====================
+            logger.info(f"\n[TREND ANALYSIS]")
+            trend_1h, distance_1h = self.detect_trend(df_1h)
+            trend_15m, distance_15m = self.detect_trend(df_15m)
+
+            logger.info(f"  H1 Trend: {trend_1h} (distance: {distance_1h*100:.2f}%)")
+            logger.info(f"  M15 Trend: {trend_15m} (distance: {distance_15m*100:.2f}%)")
+
+            if trend_1h == 'BULLISH' and trend_15m in ['BULLISH', 'NEUTRAL']:
+                score += 25
+                signals.append("✅ BULLISH trend alignment")
+                logger.info(f"  [+25] Bullish alignment")
+            elif trend_1h == 'BEARISH' and trend_15m in ['BEARISH', 'NEUTRAL']:
+                score += 25
+                signals.append("✅ BEARISH trend alignment")
+                logger.info(f"  [+25] Bearish alignment")
+            else:
+                warnings.append("⚠️ Trend conflict")
+                logger.warning(f"  [-5] Trend conflict")
+                score -= 5
+
+            # ==================== MARKET REGIME ====================
+            logger.info(f"\n[MARKET REGIME]")
+            regime_1h = self.detect_market_regime(df_1h)
+            logger.info(f"  H1 Regime: {regime_1h}")
+
+            if regime_1h == 'TRENDING':
+                score += 10
+                signals.append("✅ H1 Strong Trend (ADX > 25)")
+                logger.info(f"  [+10] Strong trend")
+            elif regime_1h == 'RANGING':
+                score += 5
+                signals.append("✅ Consolidation - breakout setup")
+                logger.info(f"  [+5] Consolidation")
+
+            # ==================== ATR FILTER ====================
+            logger.info(f"\n[VOLATILITY CHECK]")
+            atr_pct = self.calculate_atr_pct(df_15m)
+            logger.info(f"  ATR: {atr_pct*100:.3f}%")
+
+            min_atr = 0.002 if symbol in ['GOLD', 'XAUUSD', 'XAGUSD'] else Config.MIN_ATR_PCT
+            max_atr = Config.MAX_ATR_PCT
+
+            if atr_pct < min_atr:
+                warnings.append(f"⚠️ ATR too low: {atr_pct*100:.3f}%")
+                logger.warning(f"  [BLOCK] ATR too low")
+                return {
+                    'score': 0,
+                    'signal': 'NONE',
+                    'reason': 'ATR too low',
+                    'symbol': symbol
+                }
+
+            if atr_pct > max_atr:
+                warnings.append(f"⚠️ ATR too high: {atr_pct*100:.3f}% (news?)")
+                logger.warning(f"  [BLOCK] ATR too high")
+                return {
+                    'score': 0,
+                    'signal': 'NONE',
+                    'reason': 'ATR too high',
+                    'symbol': symbol
+                }
+
+            score += 10
+            logger.info(f"  [+10] ATR OK")
+
+            # ==================== RSI CHECK ====================
+            rsi = float(self.calculate_rsi(df_15m, 14).iloc[-1])
+            logger.info(f"\n[RSI]")
+            logger.info(f"  RSI: {rsi:.1f}")
+
+            if 25 < rsi < 75:
+                score += 5
+                logger.info(f"  [+5] RSI neutral")
+            else:
+                warnings.append(f"⚠️ RSI extreme: {rsi:.1f}")
+                logger.warning(f"  [-3] RSI extreme")
+                score -= 3
+
+            # ==================== CONFLICT DETECTION ====================
+            logger.info(f"\n[SIGNAL QUALITY CHECK]")
+            bullish_count = sum(1 for s in signals if 'BULL' in s.upper() or 'PWL' in s or 'bounce' in s.lower())
+            bearish_count = sum(1 for s in signals if 'BEAR' in s.upper() or 'PWH' in s or 'rejection' in s.lower())
+
+            logger.info(f"  Bullish factors: {bullish_count}")
+            logger.info(f"  Bearish factors: {bearish_count}")
+
+            # 🚫 HARD BLOCK: conflicting signals
+            if abs(bullish_count - bearish_count) <= 1:
+                warnings.append("⚠️ CONFLICTING SIGNALS - no clear direction")
+                logger.warning(f"  [BLOCKED] Signal conflict detected")
+                return {
+                    'score': score,
+                    'signal': 'NONE',
+                    'reason': 'Conflicting signals - unclear direction',
+                    'symbol': symbol,
+                    'bullish_count': bullish_count,
+                    'bearish_count': bearish_count
+                }
+
+            logger.info(f"  [OK] Clear direction: {'BULLISH' if bullish_count > bearish_count else 'BEARISH'}")
+
+            # ==================== DETERMINE SIGNAL ====================
+            logger.info(f"\n{'='*60}")
+            logger.info(f"[FINAL SCORE] {score}")
+            logger.info(f"[MIN REQUIRED] {Config.MIN_SCORE}")
+            logger.info(f"{'='*60}")
+
+            signal_type = 'NONE'
+
+            if score >= Config.MIN_SCORE:
+                # Determine direction based on clear majority
+                if bullish_count > bearish_count:
+                    if trend_1h in ['BULLISH', 'NEUTRAL']:
+                        signal_type = 'LONG'
+                    else:
+                        logger.warning(f"  [CONFLICT] Bullish signals but bearish trend")
+                        signal_type = 'WAIT'
+                elif bearish_count > bullish_count:
+                    if trend_1h in ['BEARISH', 'NEUTRAL']:
+                        signal_type = 'SHORT'
+                    else:
+                        logger.warning(f"  [CONFLICT] Bearish signals but bullish trend")
+                        signal_type = 'WAIT'
+                else:
+                    signal_type = 'WAIT'
+            else:
+                logger.warning(f"  [LOW SCORE] {score} < {Config.MIN_SCORE}")
+
+            # ==================== 🆕 BOS + MOMENTUM CONFIRMATION ====================
+            if signal_type in ['LONG', 'SHORT']:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"[🔥 ENTRY CONFIRMATION] Checking BOS + Momentum...")
+                logger.info(f"{'='*60}")
+                
+                # 🆕 ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА BOS
+                bos_confirmed, bos_msg = self.confirm_bos_entry(
+                    df_15m, 
+                    'LONG' if signal_type == 'LONG' else 'SHORT'
+                )
+                
+                if not bos_confirmed:
+                    logger.warning(f"[❌ BOS REJECT] {symbol}: {bos_msg}")
+                    return {
+                        'symbol': symbol,
+                        'signal': 'NONE',
+                        'score': score,
+                        'entry_price': current_price,
+                        'reason': f"No BOS confirmation: {bos_msg}",
+                        'reasons': signals + [f"❌ No BOS: {bos_msg}"],
+                        'warnings': warnings,
+                        'atr_pct': atr_pct,
+                        'trend_1h': trend_1h,
+                        'trend_15m': trend_15m,
+                        'rsi': rsi,
+                        'session_info': session_info,
+                        'volume_ratio': volume_ratio
+                    }
+                
+                logger.info(f"[+15] ✅ {bos_msg}")
+                signals.append(f"✅ BOS: {bos_msg}")
+                score += 15  # Бонус за подтверждение
+                
+                # 🆕 ПРОВЕРКА MOMENTUM ПРЯМО СЕЙЧАС
+                has_momentum, momentum_score = self.check_immediate_momentum(
+                    df_15m, 
+                    'LONG' if signal_type == 'LONG' else 'SHORT'
+                )
+                
+                if not has_momentum:
+                    logger.warning(f"[❌ MOMENTUM REJECT] {symbol}: No immediate momentum")
+                    return {
+                        'symbol': symbol,
+                        'signal': 'NONE',
+                        'score': score,
+                        'entry_price': current_price,
+                        'reason': "No immediate momentum",
+                        'reasons': signals + ["❌ No immediate momentum"],
+                        'warnings': warnings,
+                        'atr_pct': atr_pct,
+                        'trend_1h': trend_1h,
+                        'trend_15m': trend_15m,
+                        'rsi': rsi,
+                        'session_info': session_info,
+                        'volume_ratio': volume_ratio
+                    }
+                
+                momentum_bonus = int(momentum_score * 0.2)
+                logger.info(f"[+{momentum_bonus}] ✅ Strong Momentum: {momentum_score:.0f}/100")
+                signals.append(f"✅ Momentum: {momentum_score:.0f}/100")
+                score += momentum_bonus  # До +20 баллов
+                
+                logger.info(f"\n[✅ FINAL SCORE AFTER CONFIRMATION] {score}")
+                logger.info(f"[✅ SIGNAL CONFIRMED] {signal_type}")
+
+            logger.info(f"[SIGNAL] {signal_type}")
+
+            return {
+                'score': score,
+                'signal': signal_type,
+                'entry_price': current_price,
+                'reasons': signals,
+                'warnings': warnings,
+                'atr_pct': atr_pct,
+                'trend_1h': trend_1h,
+                'trend_15m': trend_15m,
+                'rsi': rsi,
+                'symbol': symbol,
+                'session_info': session_info,
+                'volume_ratio': volume_ratio,
+                'bullish_count': bullish_count,
+                'bearish_count': bearish_count,
+                'weekly_levels': weekly_levels,
+                'stb_manipulation': stb_manip,
+                'inducement': inducement
+            }
+
+        except Exception as e:
+            logger.error(f"[SMC ANALYSIS ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'score': 0,
+                'signal': 'NONE',
+                'reason': str(e),
+                'reasons': [],
+                'warnings': [],
+                'symbol': symbol
+            }
