@@ -1,0 +1,1880 @@
+В итоге это должен быть отдельный класс, в котором это все управляется. 
+
+SetupDetector.def analyze_signal(self, df: pd.DataFrame, symbol: str,
+                   exchange=None, htf_data: Optional[Dict] = None) -> Dict:
+        if len(df) < Config.MA_GOLDEN_SLOW:
+            return {'score': 0, 'signal': 'NONE', 'reason': 'Insufficient data', 'direction': None}
+
+
+        # ── Инициализация флагов ──────────────────────────────────────────────
+        htf_4h_counter_trend = False
+
+
+        df = df.copy()
+        df['ema_fast']  = self.ta.calculate_ema(df, Config.EMA_FAST)
+        df['ema_slow']  = self.ta.calculate_ema(df, Config.EMA_SLOW)
+        df['ema_10']    = self.ta.calculate_ema(df, 10)
+        df['ema_50']    = self.ta.calculate_ema(df, 50)
+        df['ema_200']   = self.ta.calculate_ema(df, Config.MA_GOLDEN_SLOW)
+        df['volume_ma'] = df['volume'].rolling(window=Config.VOLUME_MA_PERIOD).mean()
+        df['rsi']       = self.calculate_rsi(df, 14)
+        df['macd'], df['macd_signal'] = self.calculate_macd(df)
+
+
+        supertrend, st_direction = self.ta.calculate_supertrend(
+            df, Config.SUPERTREND_PERIOD, Config.SUPERTREND_MULTIPLIER
+        )
+        df['supertrend']   = supertrend
+        df['st_direction'] = st_direction
+
+
+        current  = df.iloc[-1]
+        prev     = df.iloc[-2]
+        prev_vol = df.iloc[-3]
+
+
+        current_price  = float(current['close'])
+        current_rsi    = float(current['rsi']) if not pd.isna(current['rsi']) else 50.0
+        current_volume = float(current['volume'])
+        volume_ma      = float(current['volume_ma']) if not pd.isna(current['volume_ma']) else current_volume
+        prev_volume    = float(prev['volume'])
+
+
+        # ── 2. ПАТТЕРНЫ ───────────────────────────────────────────────────────
+        swing_points   = self.find_swing_points(df, 30)
+        sr_levels      = self.find_support_resistance(df, 50)
+        fvg            = self.detect_fvg(df)
+        mss            = self.detect_mss(df, 20, symbol=symbol)
+        liquidity_grab = self.detect_liquidity_grab(df)
+        pullback       = self.detect_pullback_to_ema(df, 10)
+        head_shoulders = self.detect_head_and_shoulders(df)
+        rsi_div        = self.detect_rsi_divergence(df)
+
+
+        wedge_result  = self.wedge_strategy.analyze(df, symbol)
+        wedge_pattern = wedge_result['pattern']
+
+
+        # ── 3. DIRECTION VOTE ─────────────────────────────────────────────────
+        ema_fast_val = float(current['ema_fast'])
+        ema_slow_val = float(current['ema_slow'])
+        ema_50_val   = float(current['ema_50'])
+        st_dir_val   = float(st_direction.iloc[-1]) if not pd.isna(st_direction.iloc[-1]) else 0
+        macd_val     = float(current['macd'])         if not pd.isna(current['macd'])         else 0
+        signal_val   = float(current['macd_signal'])  if not pd.isna(current['macd_signal'])  else 0
+
+
+        votes = []
+        votes.append(1  if ema_fast_val > ema_slow_val else (-1 if ema_fast_val < ema_slow_val else 0))
+        votes.append(1  if current_price > ema_50_val  else (-1 if current_price < ema_50_val  else 0))
+        votes.append(int(st_dir_val) if st_dir_val in (1, -1) else 0)
+        votes.append(1  if macd_val > signal_val else (-1 if macd_val < signal_val else 0))
+        votes.append(1  if current_rsi > 55      else (-1 if current_rsi < 45      else 0))
+        votes.append(2  if mss == 'BULLISH_MSS'  else (-2 if mss == 'BEARISH_MSS'  else 0))
+        votes.append(2  if liquidity_grab == 'BULLISH_LIQUIDITY_GRAB'
+                    else (-2 if liquidity_grab == 'BEARISH_LIQUIDITY_GRAB' else 0))
+        votes.append(1  if fvg and fvg['type'] == 'BULLISH'
+                    else (-1 if fvg and fvg['type'] == 'BEARISH' else 0))
+
+
+        vote_sum  = sum(votes)
+        ema_200_v = float(current['ema_200']) if not pd.isna(current['ema_200']) else current_price
+        direction = 'LONG' if vote_sum > 0 else ('SHORT' if vote_sum < 0
+                    else ('LONG' if current_price > ema_200_v else 'SHORT'))
+
+
+        # [FIX] Vote bonus — применяется в скоринге позже
+        vote_bonus = max(0, abs(vote_sum) - 2) * 4
+
+
+        logger.info(f"[SIGNAL] {symbol}: direction={direction} (votes={vote_sum})")
+
+
+        # ── [FIX] 4H CHECK ДО liq_result — чтобы htf_aligned был корректным ──
+        if htf_data and '4h' in htf_data:
+            df_4h_check = htf_data['4h']
+            if df_4h_check is not None and len(df_4h_check) >= 50:
+                if not self._check_higher_tf_trend(df_4h_check, direction):
+                    htf_4h_counter_trend = True
+                    logger.warning(f"[4H TREND] {symbol}: {direction} goes against 4H trend")
+
+
+        # htf_aligned теперь корректен: True=4H совпадает, False=против 4H
+        liq_result = self.liquidity_analyzer.analyze(
+            df, direction, symbol,
+            htf_aligned=not htf_4h_counter_trend
+        )
+        liquidity_pools = (
+            liq_result['zones'].get('bsl', []) +
+            liq_result['zones'].get('ssl', [])
+        )
+
+
+        # ── 4. ФИЛЬТР: ПОЗИЦИЯ В ДИАПАЗОНЕ (адаптивный) ─────────────────────
+        support    = sr_levels.get('support')    or sr_levels.get('recent_low')
+        resistance = sr_levels.get('resistance') or sr_levels.get('recent_high')
+
+
+        range_filter_passed = True
+        range_position_pct  = None
+
+
+        if support and resistance and resistance > support and resistance > current_price:
+            rng                = resistance - support
+            range_position_pct = (current_price - support) / rng
+
+
+            is_trending  = st_dir_val in (1, -1)
+            thresh_long  = 0.70 if (is_trending and direction == 'LONG'  and st_dir_val ==  1) else 0.40
+            thresh_short = 0.40 if (is_trending and direction == 'SHORT' and st_dir_val == -1) else 0.60
+
+
+            if direction == 'LONG'  and range_position_pct > thresh_long:
+                range_filter_passed = False
+                logger.warning(
+                    f"[RANGE FILTER] {symbol}: LONG BLOCKED — "
+                    f"{range_position_pct*100:.0f}% (limit {thresh_long*100:.0f}%)"
+                )
+            elif direction == 'SHORT' and range_position_pct < thresh_short:
+                range_filter_passed = False
+                logger.warning(
+                    f"[RANGE FILTER] {symbol}: SHORT BLOCKED — "
+                    f"{range_position_pct*100:.0f}% (limit {thresh_short*100:.0f}%)"
+                )
+
+
+        if not range_filter_passed:
+            # [FIX] Sweep обходит ТОЛЬКО range filter — не HTF trend
+            sweep_bypasses_range = (
+                liq_result.get('sweep') is not None and
+                liq_result['sweep'].get('signal') == direction and
+                liq_result['sweep'].get('confirmed', False)
+            )
+            if wedge_result['bypass_range_filter']:
+                logger.info(f"[RANGE FILTER] {symbol}: bypassed — confirmed wedge breakout")
+            elif sweep_bypasses_range:
+                logger.info(
+                    f"[RANGE FILTER] {symbol}: bypassed — confirmed "
+                    f"{liq_result['sweep']['type']} sweep"
+                )
+            else:
+                return {
+                    'score': 0, 'signal': 'NONE', 'direction': direction,
+                    'reason': f'RANGE_FILTER: {range_position_pct*100:.0f}% — not at boundary',
+                    'entry_price': current_price, 'rsi': current_rsi,
+                    'sr_levels': sr_levels, 'swing_points': swing_points,
+                    'wedge_result': wedge_result, 'wedge_sl': 0.0,
+                    'wedge_tp': 0.0, 'wedge_active': False,
+                    'liquidity_pools': liquidity_pools, 'liq_result': liq_result,
+                    'range_position_pct': round(range_position_pct * 100, 1) if range_position_pct else None,
+                }
+
+
+        # ── 5. ФИЛЬТР: HIGHER TF TREND ───────────────────────────────────────
+        # [FIX] Sweep больше НЕ обходит HTF trend — только range filter
+        # [FIX] 4H уже проверен выше — здесь только 15m
+        if htf_data and '15m' in htf_data:
+            df_15m_check = htf_data['15m']
+            if df_15m_check is not None and len(df_15m_check) > 50:
+                if not self._check_higher_tf_trend(df_15m_check, direction):
+                    return {
+                        'score': 0, 'signal': 'NONE', 'direction': direction,
+                        'reason': f'HTF_TREND_FILTER: {direction} rejected by 15m trend',
+                        'entry_price': current_price, 'rsi': current_rsi,
+                        'sr_levels': sr_levels, 'swing_points': swing_points,
+                        'wedge_result': wedge_result, 'wedge_sl': 0.0,
+                        'wedge_tp': 0.0, 'wedge_active': False,
+                        'liquidity_pools': liquidity_pools, 'liq_result': liq_result,
+                        'range_position_pct': round(range_position_pct * 100, 1) if range_position_pct else None,
+                    }
+        elif exchange and (htf_data is None or '15m' not in htf_data):
+            try:
+                df_15m_raw = exchange.fetch_ohlcv(symbol, '15m', limit=200)
+                if df_15m_raw is not None and len(df_15m_raw) > 50:
+                    df_15m_f = pd.DataFrame(
+                        df_15m_raw,
+                        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                    )
+                    if not self._check_higher_tf_trend(df_15m_f, direction):
+                        return {
+                            'score': 0, 'signal': 'NONE', 'direction': direction,
+                            'reason': f'HTF_TREND_FILTER: {direction} rejected by 15m trend',
+                            'entry_price': current_price, 'rsi': current_rsi,
+                            'sr_levels': sr_levels, 'swing_points': swing_points,
+                            'wedge_result': wedge_result, 'wedge_sl': 0.0,
+                            'wedge_tp': 0.0, 'wedge_active': False,
+                            'liquidity_pools': liquidity_pools, 'liq_result': liq_result,
+                            'range_position_pct': round(range_position_pct * 100, 1) if range_position_pct else None,
+                        }
+            except Exception as e:
+                logger.warning(f"[HTF FILTER] {e}")
+
+
+        # ── 6. SCORING ────────────────────────────────────────────────────────
+        score = 0
+        signals: List[str] = []
+        professional_analysis: Dict = {}
+
+
+        # 6.1 Volume Filter
+        volume_ratio      = current_volume / volume_ma if volume_ma > 0 else 1.0
+        prev_volume_ratio = float(prev_vol['volume']) / volume_ma if volume_ma > 0 else 1.0
+
+
+        if volume_ratio < Config.MIN_VOLUME_RATIO:
+            return {
+                'score': 0, 'signal': 'NONE', 'direction': direction,
+                'reason': f'VOLUME_FILTER: ratio={volume_ratio:.2f} < {Config.MIN_VOLUME_RATIO}',
+                'entry_price': current_price, 'rsi': current_rsi,
+                'sr_levels': sr_levels, 'swing_points': swing_points,
+                'wedge_result': wedge_result, 'wedge_sl': 0.0,
+                'wedge_tp': 0.0, 'wedge_active': False,
+                'liquidity_pools': liquidity_pools, 'liq_result': liq_result,
+                'range_position_pct': round(range_position_pct * 100, 1) if range_position_pct else None,
+            }
+        elif volume_ratio >= 2.0:
+            score -= 5
+            signals.append(f"VOL_SURGE_NOW x{volume_ratio:.1f} (late entry risk)")
+        elif prev_volume_ratio >= 2.0 and volume_ratio < 1.5:
+            score += 15
+            signals.append(f"POST_VOL_SURGE_PULLBACK x{prev_volume_ratio:.1f}")
+        else:
+            score += 8
+            signals.append(f"VOL_OK x{volume_ratio:.1f}")
+
+
+        # 6.2 EMA Alignment
+        if direction == 'LONG':
+            if ema_fast_val > ema_slow_val: score += 10; signals.append("EMA_BULLISH_CROSS")
+            if current_price > ema_50_val:  score += 8;  signals.append("ABOVE_EMA50")
+        else:
+            if ema_fast_val < ema_slow_val: score += 10; signals.append("EMA_BEARISH_CROSS")
+            if current_price < ema_50_val:  score += 8;  signals.append("BELOW_EMA50")
+
+
+        # 6.3 SuperTrend
+        if   direction == 'LONG'  and st_dir_val ==  1: score += 15; signals.append("SUPERTREND_BULLISH")
+        elif direction == 'SHORT' and st_dir_val == -1: score += 15; signals.append("SUPERTREND_BEARISH")
+
+
+        # 6.4 MACD momentum
+        macd_hist      = macd_val - signal_val
+        prev_macd_hist = (float(prev['macd']) - float(prev['macd_signal'])
+                        if not pd.isna(prev['macd']) else 0)
+        if   direction == 'LONG'  and macd_hist > 0 and macd_hist > prev_macd_hist:
+            score += 10; signals.append("MACD_BULLISH_MOMENTUM")
+        elif direction == 'SHORT' and macd_hist < 0 and macd_hist < prev_macd_hist:
+            score += 10; signals.append("MACD_BEARISH_MOMENTUM")
+
+
+        # 6.5 RSI — [FIX] Хард-блок LONG >= 75 / SHORT <= 25 + новая лесенка
+        _rpi_base = {
+            'score': 0, 'signal': 'NONE', 'direction': direction,
+            'entry_price': current_price, 'rsi': current_rsi,
+            'sr_levels': sr_levels, 'swing_points': swing_points,
+            'wedge_result': wedge_result, 'wedge_sl': 0.0,
+            'wedge_tp': 0.0, 'wedge_active': False,
+            'liquidity_pools': liquidity_pools, 'liq_result': liq_result,
+            'range_position_pct': round(range_position_pct * 100, 1) if range_position_pct else None,
+            'professional_analysis': {},
+        }
+
+
+        if direction == 'LONG':
+            if current_rsi >= 75:
+                return {**_rpi_base,
+                        'reason': f'RSI_HARD_BLOCK: {current_rsi:.0f} >= 75 — overbought LONG blocked'}
+            elif 70 <= current_rsi < 75: score -= 20; signals.append(f"RSI_EXTREME_OB({current_rsi:.0f})")
+            elif 65 <= current_rsi < 70: score -= 10; signals.append(f"RSI_OVERBOUGHT({current_rsi:.0f})")
+            elif 60 <= current_rsi < 65: pass
+            elif 40 <= current_rsi < 60: score += 8;  signals.append(f"RSI_NEUTRAL({current_rsi:.0f})")
+            elif 30 <= current_rsi < 40: score += 12; signals.append(f"RSI_OVERSOLD({current_rsi:.0f})")
+            else:                         score += 18; signals.append(f"RSI_DEEP_OVERSOLD({current_rsi:.0f})")
+        else:  # SHORT
+            if current_rsi <= 25:
+                return {**_rpi_base,
+                        'reason': f'RSI_HARD_BLOCK: {current_rsi:.0f} <= 25 — oversold SHORT blocked'}
+            elif 25 < current_rsi <= 30: score -= 20; signals.append(f"RSI_EXTREME_OS({current_rsi:.0f})")
+            elif 30 < current_rsi <= 35: score -= 10; signals.append(f"RSI_OVERSOLD({current_rsi:.0f})")
+            elif 35 < current_rsi <= 40: pass
+            elif 40 < current_rsi <= 60: score += 8;  signals.append(f"RSI_NEUTRAL({current_rsi:.0f})")
+            elif 60 < current_rsi <= 70: score += 12; signals.append(f"RSI_OVERBOUGHT({current_rsi:.0f})")
+            else:                         score += 18; signals.append(f"RSI_DEEP_OB({current_rsi:.0f})")
+
+
+        # 6.6 RSI Divergence
+        if rsi_div:
+            professional_analysis['rsi_divergence'] = rsi_div
+            aligned = ((direction == 'LONG'  and rsi_div['type'] == 'BULLISH_DIVERGENCE') or
+                    (direction == 'SHORT' and rsi_div['type'] == 'BEARISH_DIVERGENCE'))
+            if aligned:
+                bonus = 25 if rsi_div['strength'] == 'STRONG' else 20
+                score += bonus; signals.append(f"{rsi_div['type']} ({rsi_div['strength']})")
+            else:
+                penalty = 20 if rsi_div['strength'] == 'STRONG' else 15
+                score  -= penalty; signals.append(f"COUNTER_DIV_PENALTY: {rsi_div['type']}")
+
+
+        # 6.7 MSS
+        if mss:
+            if ((direction == 'LONG'  and mss == 'BULLISH_MSS') or
+                    (direction == 'SHORT' and mss == 'BEARISH_MSS')):
+                score += 20; signals.append(f"MSS: {mss}")
+            else:
+                score -= 10; signals.append(f"COUNTER_MSS_PENALTY: {mss}")
+
+
+        # 6.8 Liquidity Grab
+        if liquidity_grab:
+            if ((direction == 'LONG'  and liquidity_grab == 'BULLISH_LIQUIDITY_GRAB') or
+                    (direction == 'SHORT' and liquidity_grab == 'BEARISH_LIQUIDITY_GRAB')):
+                score += 20; signals.append(f"LIQ_GRAB: {liquidity_grab}")
+            else:
+                score -= 5; signals.append(f"COUNTER_LIQ_GRAB: {liquidity_grab}")
+
+
+        # 6.9 FVG
+        if fvg:
+            if ((direction == 'LONG'  and fvg['type'] == 'BULLISH') or
+                    (direction == 'SHORT' and fvg['type'] == 'BEARISH')):
+                score += 15; signals.append(f"FVG_{fvg['type']} ({fvg['size_pct']:.2f}%)")
+            else:
+                score -= 5; signals.append(f"COUNTER_FVG: {fvg['type']}")
+
+
+        # 6.10 Pullback to EMA
+        if pullback:
+            if ((direction == 'LONG'  and pullback == 'BULLISH_PULLBACK') or
+                    (direction == 'SHORT' and pullback == 'BEARISH_PULLBACK')):
+                score += 12; signals.append(f"PULLBACK: {pullback}")
+
+
+        # 6.11 Head & Shoulders
+        if head_shoulders:
+            if direction == 'LONG':  score -= 20; signals.append("H&S_BEARISH_PENALTY")
+            else:                     score += 15; signals.append("HEAD_AND_SHOULDERS_BEARISH")
+
+
+        # 6.12 Wedge / Triangle / Pennant
+        if wedge_result['signal'] != 'NONE':
+            if wedge_result['signal'] == direction:
+                score += wedge_result['score_boost']
+                signals.append(
+                    f"WEDGE_{wedge_result['pattern']['type']}"
+                    f"_{wedge_result['position']['zone']}"
+                    f" str={wedge_result['pattern']['strength']:.2f}"
+                )
+            else:
+                score -= 12
+                signals.append(
+                    f"WEDGE_COUNTER_DIRECTION_PENALTY "
+                    f"({wedge_result['signal']} vs {direction})"
+                )
+        elif wedge_result['pattern'] is not None:
+            score -= 5
+            signals.append(f"WEDGE_{wedge_result['pattern']['type']}_MID_WAIT")
+
+
+        # 6.13 Liquidity Zone Analysis — BSL/SSL sweep + targets
+        score   += liq_result['score_delta']
+        signals += liq_result['signals']
+        if liq_result.get('sweep'):
+            professional_analysis['liquidity_sweep'] = liq_result['sweep']
+        if liq_result.get('nearest_target'):
+            professional_analysis['liquidity_target'] = liq_result['nearest_target']
+
+
+        # 6.14 Weekly Levels
+        try:
+            weekly = self.get_weekly_levels(df)
+            if weekly:
+                professional_analysis['weekly_levels'] = weekly
+                dist_wo  = abs(current_price - weekly['week_open']) / current_price * 100
+                dist_pwh = (current_price - weekly['pwh']) / current_price * 100
+                dist_pwl = (current_price - weekly['pwl']) / current_price * 100
+                if dist_wo < 0.5:
+                    score += 15; signals.append(f"WEEK_OPEN_SYNC (${weekly['week_open']:.4f})")
+                if abs(dist_pwh) < 1.0:
+                    if direction == 'SHORT': score += 12; signals.append(f"PWH_RESISTANCE_TEST (${weekly['pwh']:.4f})")
+                    else:                     score -= 8;  signals.append(f"PWH_RESISTANCE_PENALTY (${weekly['pwh']:.4f})")
+                if abs(dist_pwl) < 1.0:
+                    if direction == 'LONG':  score += 12; signals.append(f"PWL_SUPPORT_TEST (${weekly['pwl']:.4f})")
+                    else:                     score -= 8;  signals.append(f"PWL_SUPPORT_PENALTY (${weekly['pwl']:.4f})")
+        except Exception as e:
+            logger.debug(f"[WEEKLY] {e}")
+
+
+        # 6.15 StB Manipulation
+        try:
+            stb = self.detect_stb_manipulation(df)
+            if stb:
+                professional_analysis['stb_manipulation'] = stb
+                aligned = ((direction == 'LONG'  and 'BULLISH' in stb['type']) or
+                        (direction == 'SHORT' and 'BEARISH' in stb['type']))
+                if aligned:
+                    score += 25 if stb['strength'] == 'STRONG' else 20
+                    signals.append(f"STB_{stb['type']} ({stb['strength']})")
+                else:
+                    score -= 10; signals.append(f"COUNTER_STB_PENALTY: {stb['type']}")
+        except Exception as e:
+            logger.debug(f"[STB] {e}")
+
+
+        # 6.16 Multi-TF Confluence
+        htf_source = htf_data
+        if not htf_source and exchange:
+            try:
+                htf_source = {
+                    '15m': exchange.fetch_ohlcv(symbol, '15m', limit=200),
+                    '1h':  exchange.fetch_ohlcv(symbol, '1h',  limit=100),
+                    '4h':  exchange.fetch_ohlcv(symbol, '4h',  limit=100),
+                    '1d':  exchange.fetch_ohlcv(symbol, '1d',  limit=50),
+                }
+            except Exception as e:
+                logger.debug(f"[MTF fallback fetch] {e}")
+
+
+        if htf_source:
+            try:
+                mtf = self.analyze_multi_tf_confluence(symbol, htf_source)
+                if mtf and mtf.get('score', 0) > 0:
+                    professional_analysis['mtf_confluence'] = mtf
+                    mtf_bonus = min(mtf['score'], 50)
+                    score += mtf_bonus
+                    signals.append(f"MTF_CONFLUENCE +{mtf_bonus} ({len(mtf.get('factors', []))} factors)")
+            except Exception as e:
+                logger.debug(f"[MTF] {e}")
+
+
+        # 6.17 Implicit R:R через SR-уровни
+        if direction == 'LONG' and resistance and support and resistance > current_price:
+            pot_profit = resistance - current_price
+            pot_loss   = current_price - support
+            if pot_loss > 0:
+                irr = pot_profit / pot_loss
+                if irr < Config.MIN_RR_RATIO:
+                    score -= 15; signals.append(f"LOW_IMPLICIT_RR_{irr:.1f}_PENALTY")
+                else:
+                    score += 8;  signals.append(f"RR_OK_{irr:.1f}")
+
+
+        # 6.18 [FIX] 4H Counter-Trend Penalty (флаг установлен в начале функции)
+        if htf_4h_counter_trend:
+            score -= 25
+            signals.append("4H_COUNTER_TREND_PENALTY")
+
+
+        # 6.19 Vote Strength Bonus
+        if vote_bonus > 0:
+            score += vote_bonus
+            signals.append(f"VOTES_{vote_sum:+d} (+{vote_bonus}pts)")
+
+
+        # ── 7. ИТОГОВЫЙ СИГНАЛ ────────────────────────────────────────────────
+        score     = max(score, 0)
+        min_score = Config.MIN_MULTI_TF_SCORE if Config.REQUIRE_MULTI_TF else Config.MIN_SCORE
+        signal    = direction if score >= min_score else 'NONE'
+
+
+        logger.info(
+            f"[SIGNAL] {symbol}: {signal} | score={score} | "
+            f"direction={direction} | factors={len(signals)}"
+        )
+
+
+        atr_val = float(df['close'].iloc[-1] - df['close'].iloc[-2])
+        try:
+            tr = pd.concat([
+                df['high'] - df['low'],
+                (df['high'] - df['close'].shift()).abs(),
+                (df['low']  - df['close'].shift()).abs(),
+            ], axis=1).max(axis=1)
+            atr_val = float(tr.rolling(14).mean().iloc[-1])
+        except Exception:
+            pass
+
+
+        return {
+            'score':                 score,
+            'signal':                signal,
+            'direction':             direction,
+            'direction_votes':       vote_sum,
+            'reason':                ' | '.join(signals) if signals else 'No signals',
+            'entry_price':           current_price,
+            'rsi':                   current_rsi,
+            'volume_ratio':          round(volume_ratio, 2),
+            'atr':                   atr_val,
+            'fvg':                   fvg,
+            'sr_levels':             sr_levels,
+            'swing_points':          swing_points,
+            'wedge_pattern':         wedge_pattern,
+            'wedge_result':          wedge_result,
+            'wedge_sl':              wedge_result['sl_price'],
+            'wedge_tp':              wedge_result['tp_price'],
+            'wedge_active':          wedge_result['signal'] != 'NONE',
+            'liquidity_pools':       liquidity_pools,
+            'liq_result':            liq_result,
+            'mss':                   mss,
+            'liquidity_grab':        liquidity_grab,
+            'range_position_pct':    round(range_position_pct * 100, 1) if range_position_pct else None,
+            'professional_analysis': professional_analysis,
+        }
+    
+"""
+ORDER MANAGER - Exchange-Side SL + TP Orders
+BingX Perpetual Futures - Hedge Mode
+All exit orders placed on exchange immediately after position opens.
+
+
+Changelog vs. предыдущей версии:
+  - force_close_position()   : правильный positionSide для Hedge Mode (главный баг)
+  - emergency_close()        : circuit breaker — макс 3 попытки, потом MANUAL ALERT
+  - _place_sl_with_retry()   : exponential backoff при ошибке API (3 попытки)
+  - update_sl()              : place-then-cancel — сначала новый SL, потом отмена старого
+                               (позиция НИКОГДА не остаётся без защиты)
+  - cancel_sl_order()        : не удаляет из tracking при неуспешной отмене
+  - _calc_tp_amounts()       : sum(amounts) == position_size гарантировано
+  - has_sl() / has_orders()  : хелперы для внешней проверки
+  - reset_emergency_state()  : сброс счётчика после успешного закрытия
+"""
+
+
+import logging
+import time
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+import ccxt
+
+
+logger = logging.getLogger(__name__)
+
+
+MAX_SL_RETRY_ATTEMPTS  = 3   # Попыток разместить SL (с backoff)
+MAX_EMERGENCY_ATTEMPTS = 3   # Попыток emergency close до MANUAL ALERT
+
+
+
+class OrderManager:
+    """
+    Все защитные ордера выставляются на БИРЖУ, не отслеживаются ботом.
+
+
+    active_sl_orders : {symbol: {order_id, type, price, side, timestamp}}
+    active_tp_orders : {symbol: [{order_id, tp_index, price, amount}, ...]}
+    """
+
+
+    def __init__(self, exchange: ccxt.Exchange, notifier, margin_mode: str = 'cross'):
+        self.exchange    = exchange
+        self.notifier    = notifier
+        self.margin_mode = margin_mode  # 'cross' или 'isolated'
+
+
+        self.active_sl_orders: Dict = {}
+        self.active_tp_orders: Dict = {}
+
+
+        # Circuit breaker: {symbol: int}  — счётчик неудачных попыток закрытия
+        self._emergency_attempts: Dict[str, int] = {}
+
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ВНУТРЕННИЕ ХЕЛПЕРЫ
+    # ═══════════════════════════════════════════════════════════════════════
+
+
+    def _params(self, side: str, stop_price: float) -> Tuple[str, dict]:
+        """
+        Возвращает (close_side, params) для любого защитного ордера BingX Hedge Mode.
+        side = сторона ОТКРЫТОЙ позиции ('long' / 'short')
+        """
+        position_side = 'LONG'  if side.lower() == 'long'  else 'SHORT'
+        close_side    = 'sell'  if side.lower() == 'long'  else 'buy'
+
+
+        params = {
+            'marginMode':   self.margin_mode,
+            'positionSide': position_side,  # ОБЯЗАТЕЛЬНО для Hedge Mode
+            'stopPrice':    stop_price,     # триггер (BingX использует stopPrice)
+            'workingType':  'MARK_PRICE',   # триггер по mark price
+            # reduceOnly — НЕ используем (BingX Hedge Mode запрещает)
+        }
+        return close_side, params
+
+
+    def _market_close_params(self, side: str) -> Tuple[str, dict]:
+        """
+        Params для РЫНОЧНОГО закрытия позиции (force_close / emergency).
+        Отличается от _params: нет stopPrice, нет workingType.
+        """
+        position_side = 'LONG'  if side.lower() == 'long'  else 'SHORT'
+        close_side    = 'sell'  if side.lower() == 'long'  else 'buy'
+
+
+        params = {
+            'marginMode':   self.margin_mode,
+            'positionSide': position_side,  # КЛЮЧЕВОЙ параметр Hedge Mode
+            'reduceOnly':   True,            # явно только закрытие
+        }
+        return close_side, params
+
+
+    def _verify_position_exists(self, symbol: str, side: str) -> bool:
+        """
+        Проверяет, что позиция реально открыта перед выставлением ордеров.
+        При ошибке API не блокирует — возвращает True.
+        """
+        try:
+            positions = self.exchange.fetch_positions([symbol])
+            for pos in positions:
+                if (pos.get('symbol') == symbol
+                        and pos.get('side', '').lower() == side.lower()
+                        and float(pos.get('contracts', 0)) > 0):
+                    return True
+            logger.error(f"[ORDERS] No open {side.upper()} position found for {symbol}!")
+            return False
+        except Exception as e:
+            logger.warning(f"[ORDERS] Position verify failed: {e} — proceeding anyway")
+            return True  # При ошибке API не блокируем
+
+
+    def _fetch_open_position(self, symbol: str) -> Optional[dict]:
+        """
+        Возвращает первую открытую позицию по символу или None.
+        Используется в force_close и emergency_close.
+        """
+        try:
+            positions = self.exchange.fetch_positions([symbol])
+            for pos in positions:
+                if (pos.get('symbol') == symbol
+                        and float(pos.get('contracts', 0)) > 0):
+                    return pos
+        except Exception as e:
+            logger.error(f"[ORDERS] fetch_open_position error for {symbol}: {e}")
+        return None
+
+
+    def _calc_tp_amounts(self, position_size: float,
+                         distribution: List[float]) -> List[float]:
+        """
+        Делит position_size по distribution, всегда целые числа.
+        Остаток добавляется к последнему TP.
+        Гарантирует: sum(amounts) == int(position_size).
+        """
+        amounts   = []
+        allocated = 0
+        n         = len(distribution)
+
+
+        for i, pct in enumerate(distribution):
+            if i == n - 1:
+                amt = int(position_size) - allocated  # остаток (может быть 0)
+            else:
+                amt       = max(1, int(round(position_size * pct)))
+                allocated += amt
+
+
+            if amt > 0:
+                amounts.append(amt)
+
+
+        return amounts
+
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SL — НАЧАЛЬНЫЙ СТОП ЛОСС
+    # ═══════════════════════════════════════════════════════════════════════
+
+
+    def _place_sl_once(self, symbol: str, side: str,
+                       position_size: float, sl_price: float) -> Optional[str]:
+        """Одна попытка выставить STOP_MARKET ордер. Возвращает order_id или None."""
+        close_side, params = self._params(side, sl_price)
+
+
+        order = self.exchange.create_order(
+            symbol = symbol,
+            type   = 'stop_market',
+            side   = close_side,
+            amount = position_size,
+            params = params
+        )
+
+
+        if order and 'id' in order:
+            return order['id']
+
+
+        logger.error(f"[SL] Order returned without ID: {order}")
+        return None
+
+
+    def _place_sl_with_retry(self, symbol: str, side: str,
+                              position_size: float, sl_price: float,
+                              attempts: int = MAX_SL_RETRY_ATTEMPTS) -> Optional[str]:
+        """
+        Пытается разместить SL с exponential backoff.
+        Возвращает order_id при успехе, None после всех попыток.
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                oid = self._place_sl_once(symbol, side, position_size, sl_price)
+                if oid:
+                    return oid
+                logger.warning(f"[SL] Attempt {attempt}/{attempts} returned no ID")
+            except Exception as e:
+                logger.warning(f"[SL] Attempt {attempt}/{attempts} failed: {e}")
+
+
+            if attempt < attempts:
+                sleep_time = 2 ** attempt  # 2s, 4s, 8s
+                logger.info(f"[SL] Retrying in {sleep_time}s...")
+                time.sleep(sleep_time)
+
+
+        return None
+
+
+    def place_initial_stop_loss(self, symbol: str, side: str,
+                                position_size: float,
+                                sl_price: float) -> Optional[str]:
+        """
+        Выставляет начальный STOP_MARKET ордер на биржу.
+        Внутри использует retry (3 попытки + backoff).
+        """
+        logger.info(f"[SL] Placing initial stop loss")
+        logger.info(f"   Symbol:   {symbol}")
+        logger.info(f"   Side:     {side.upper()} -> close {'sell' if side.lower() == 'long' else 'buy'}")
+        logger.info(f"   Size:     {position_size}")
+        logger.info(f"   SL Price: ${sl_price:.6f}")
+
+
+        oid = self._place_sl_with_retry(symbol, side, position_size, sl_price)
+
+
+        if oid:
+            self.active_sl_orders[symbol] = {
+                'order_id':  oid,
+                'type':      'initial_sl',
+                'price':     sl_price,
+                'side':      side,
+                'timestamp': datetime.now()
+            }
+            logger.info(f"[SL] ACTIVE: {oid} @ ${sl_price:.6f}")
+            self.notifier.send(
+                f"<b>SL ACTIVE</b>\n"
+                f"Symbol: {symbol}\n"
+                f"SL Price: ${sl_price:.4f}\n"
+                f"Order ID: {oid}",
+                urgent=False
+            )
+            return oid
+
+
+        # Все попытки провалились
+        logger.error(f"[SL] CRITICAL: All {MAX_SL_RETRY_ATTEMPTS} attempts failed for {symbol}")
+        self.notifier.send(
+            f"<b>CRITICAL: SL FAILED</b>\n"
+            f"Symbol: {symbol}\n"
+            f"All {MAX_SL_RETRY_ATTEMPTS} attempts failed!\n"
+            f"Position at RISK!",
+            urgent=True
+        )
+        return None
+
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ТЕЙК ПРОФИТЫ
+    # ═══════════════════════════════════════════════════════════════════════
+
+
+    def place_take_profit(self, symbol: str, side: str, amount: float,
+                          tp_price: float, tp_index: int) -> Optional[str]:
+        """
+        Выставляет один TAKE_PROFIT_MARKET ордер на биржу.
+        tp_index: 0=TP1, 1=TP2, 2=TP3
+        """
+        try:
+            close_side, params = self._params(side, tp_price)
+
+
+            logger.info(f"[TP{tp_index + 1}] Placing take profit")
+            logger.info(f"   Symbol: {symbol}")
+            logger.info(f"   Price:  ${tp_price:.6f}")
+            logger.info(f"   Amount: {amount}")
+
+
+            order = self.exchange.create_order(
+                symbol = symbol,
+                type   = 'take_profit_market',
+                side   = close_side,
+                amount = amount,
+                params = params
+            )
+
+
+            if order and 'id' in order:
+                oid = order['id']
+                if symbol not in self.active_tp_orders:
+                    self.active_tp_orders[symbol] = []
+
+
+                # Убираем старый TP с таким же индексом если был
+                self.active_tp_orders[symbol] = [
+                    t for t in self.active_tp_orders[symbol]
+                    if t['tp_index'] != tp_index
+                ]
+                self.active_tp_orders[symbol].append({
+                    'order_id': oid,
+                    'tp_index': tp_index,
+                    'price':    tp_price,
+                    'amount':   amount
+                })
+                logger.info(f"[TP{tp_index + 1}] ACTIVE: {oid} @ ${tp_price:.6f}")
+                return oid
+
+
+            logger.error(f"[TP{tp_index + 1}] Order returned without ID: {order}")
+            return None
+
+
+        except Exception as e:
+            logger.error(f"[TP{tp_index + 1}] Failed to place: {e}")
+            return None
+
+
+    def place_all_exit_orders(
+        self,
+        symbol:          str,
+        side:            str,
+        position_size:   float,
+        sl_price:        float,
+        tp_prices:       List[float],
+        tp_distribution: List[float]
+    ) -> Dict:
+        """
+        Выставляет ВСЕ ордера на биржу сразу после открытия позиции:
+          - 1 x STOP_MARKET (SL)
+          - N x TAKE_PROFIT_MARKET (по tp_distribution)
+
+
+        Возвращает:
+        {
+            'sl_id':   str | None,
+            'tp_ids':  [str|None, ...],
+            'success': bool
+        }
+        """
+        logger.info(f"[ORDERS] Placing all exit orders for {symbol} ({side.upper()})")
+        logger.info(f"   Position size: {position_size}")
+        logger.info(f"   SL:  ${sl_price:.6f}")
+        for i, (p, d) in enumerate(zip(tp_prices, tp_distribution)):
+            logger.info(f"   TP{i + 1}: ${p:.6f} ({d * 100:.0f}%)")
+
+
+        result = {
+            'sl_id':   None,
+            'tp_ids':  [None] * len(tp_prices),
+            'success': False
+        }
+
+
+        # ── Проверка позиции ──────────────────────────────────────────────
+        if not self._verify_position_exists(symbol, side):
+            logger.error(f"[ORDERS] Position not found — aborting order placement")
+            self.notifier.send(
+                f"<b>CRITICAL: NO POSITION</b>\n"
+                f"Symbol: {symbol}\n"
+                f"Side: {side.upper()}\n"
+                f"Exit orders NOT placed!",
+                urgent=True
+            )
+            return result
+
+
+        # ── SL ────────────────────────────────────────────────────────────
+        sl_id = self.place_initial_stop_loss(symbol, side, position_size, sl_price)
+        result['sl_id'] = sl_id
+
+
+        if not sl_id:
+            logger.error(f"[ORDERS] SL placement FAILED — aborting TP placement")
+            return result
+
+
+        # ── TPs ───────────────────────────────────────────────────────────
+        tp_amounts = self._calc_tp_amounts(position_size, tp_distribution)
+        all_tp_ok  = True
+
+
+        for i, (tp_price, amount) in enumerate(zip(tp_prices, tp_amounts)):
+            if amount <= 0:
+                logger.warning(f"[ORDERS] TP{i + 1} amount is 0, skipping")
+                continue
+
+
+            tp_id = self.place_take_profit(symbol, side, amount, tp_price, i)
+            result['tp_ids'][i] = tp_id
+
+
+            if not tp_id:
+                logger.warning(f"[ORDERS] TP{i + 1} placement FAILED (SL still active)")
+                all_tp_ok = False
+
+
+        result['success'] = all_tp_ok and sl_id is not None
+        logger.info(
+            f"[ORDERS] Done: SL={sl_id is not None} | "
+            f"TPs={result['tp_ids']} | OK={result['success']}"
+        )
+        return result
+
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ОБНОВЛЕНИЕ SL
+    # ═══════════════════════════════════════════════════════════════════════
+
+
+    def update_sl(self, symbol: str, side: str,
+                  new_size: float, new_price: float,
+                  label: str = 'SL') -> Optional[str]:
+        """
+        Безопасное обновление SL: сначала НОВЫЙ ордер, потом отмена старого.
+        Позиция никогда не остаётся без защиты.
+
+
+        Используется для:
+        - Перевода в безубыток (после TP1)
+        - Переноса SL на TP1 уровень (после TP2)
+        - Трейлинга
+        """
+        old_order_data = self.active_sl_orders.get(symbol)
+
+
+        # 1. Выставляем НОВЫЙ SL
+        new_id = self._place_sl_with_retry(symbol, side, new_size, new_price)
+
+
+        if new_id:
+            # 2. Обновляем tracking СРАЗУ — позиция уже под защитой
+            self.active_sl_orders[symbol] = {
+                'order_id':  new_id,
+                'type':      'updated_sl',
+                'price':     new_price,
+                'side':      side,
+                'timestamp': datetime.now()
+            }
+            logger.info(f"[{label}] Updated for {symbol}: ${new_price:.6f} size={new_size}")
+
+
+            # 3. Отменяем СТАРЫЙ ордер (уже после того как новый активен)
+            if old_order_data:
+                try:
+                    self.exchange.cancel_order(old_order_data['order_id'], symbol)
+                    logger.info(f"[{label}] Old SL cancelled: {old_order_data['order_id']}")
+                except Exception as e:
+                    # Не критично — старый мог уже сработать или истечь
+                    logger.warning(
+                        f"[{label}] Could not cancel old SL "
+                        f"{old_order_data['order_id']}: {e} — ignoring"
+                    )
+        else:
+            logger.error(f"[{label}] FAILED to place new SL for {symbol}!")
+            self.notifier.send(
+                f"<b>SL UPDATE FAILED</b>\n"
+                f"Symbol: {symbol}\n"
+                f"Label: {label}\n"
+                f"Old SL still active (if it was)",
+                urgent=True
+            )
+
+
+        return new_id  # None если не удалось
+
+
+    def move_sl_to_breakeven(self, symbol: str, side: str,
+                              entry_price: float,
+                              new_size: float) -> Optional[str]:
+        """
+        Переводит SL в безубыток (entry + fee buffer).
+        Вызывается когда TP1 заполнился.
+        """
+        # +0.2% buffer: покрывает taker fee 0.045% x2 + funding
+        be_price = entry_price * 1.002 if side.lower() == 'long' else entry_price * 0.998
+
+
+        logger.info(f"[BE] Moving SL to breakeven for {symbol}")
+        logger.info(f"   Entry: ${entry_price:.6f} -> BE: ${be_price:.6f}")
+        logger.info(f"   Remaining size: {new_size}")
+
+
+        new_id = self.update_sl(symbol, side, new_size, be_price, label='BE')
+        if new_id:
+            self.notifier.send(
+                f"<b>SL -> BREAKEVEN</b>\n"
+                f"Symbol: {symbol}\n"
+                f"Entry: ${entry_price:.4f}\n"
+                f"BE Price: ${be_price:.4f}\n"
+                f"Remaining: {new_size} contracts\n"
+                f"Loss protected!",
+                urgent=False
+            )
+        return new_id
+
+
+    def move_sl_to_tp1(self, symbol: str, side: str,
+                        tp1_price: float,
+                        new_size: float) -> Optional[str]:
+        """
+        Переносит SL на уровень TP1 (-0.5% буфер).
+        Вызывается когда TP2 заполнился.
+        """
+        sl_price = tp1_price * 0.995 if side.lower() == 'long' else tp1_price * 1.005
+
+
+        logger.info(f"[SL-TP1] Moving SL to TP1 level for {symbol}")
+        logger.info(f"   TP1: ${tp1_price:.6f} -> SL: ${sl_price:.6f}")
+
+
+        new_id = self.update_sl(symbol, side, new_size, sl_price, label='SL-TP1')
+        if new_id:
+            self.notifier.send(
+                f"<b>SL -> TP1 LEVEL</b>\n"
+                f"Symbol: {symbol}\n"
+                f"SL Price: ${sl_price:.4f}\n"
+                f"Profit locked!",
+                urgent=False
+            )
+        return new_id
+
+
+    def update_sl_size(self, symbol: str, side: str,
+                       new_size: float) -> Optional[str]:
+        """
+        Обновляет размер существующего SL (после частичного TP).
+        Пересоздаёт ордер с той же ценой, новым размером.
+        """
+        if symbol not in self.active_sl_orders:
+            logger.warning(f"[SL] No active SL for {symbol}, cannot resize")
+            return None
+
+
+        current_sl_price = self.active_sl_orders[symbol]['price']
+        return self.update_sl(symbol, side, new_size, current_sl_price, label='SL-RESIZE')
+
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # FORCE CLOSE / EMERGENCY CLOSE
+    # ═══════════════════════════════════════════════════════════════════════
+
+
+    def force_close_position(self, symbol: str,
+                              side: Optional[str] = None,
+                              contracts: Optional[float] = None) -> bool:
+        """
+        Принудительно закрывает позицию рыночным ордером.
+
+
+        ФИКС (главный баг): использует positionSide из _market_close_params()
+        В Hedge Mode без positionSide ордер ОТКРЫВАЛ новую позицию вместо закрытия.
+
+
+        side и contracts можно передать явно (если известны) или
+        они будут получены с биржи автоматически.
+        """
+        logger.critical(f"[FORCE CLOSE] Initiating for {symbol}")
+
+
+        # Получаем данные позиции если не переданы явно
+        if side is None or contracts is None:
+            pos = self._fetch_open_position(symbol)
+            if not pos:
+                logger.warning(f"[FORCE CLOSE] No open position found for {symbol}")
+                return False
+            side      = str(pos.get('side', 'long'))
+            contracts = float(pos.get('contracts', 0))
+
+
+        if contracts <= 0:
+            logger.warning(f"[FORCE CLOSE] Contracts = 0 for {symbol}, nothing to close")
+            return False
+
+
+        close_side, params = self._market_close_params(side)
+
+
+        logger.critical(
+            f"[FORCE CLOSE] {symbol} | {side.upper()} | "
+            f"{contracts} contracts | close_side={close_side} | "
+            f"positionSide={params['positionSide']}"
+        )
+
+
+        try:
+            order = self.exchange.create_order(
+                symbol = symbol,
+                type   = 'market',
+                side   = close_side,
+                amount = contracts,
+                params = params
+            )
+
+
+            if order:
+                logger.critical(f"[FORCE CLOSE] SUCCESS: {symbol}")
+                # Чистим все ордера и tracking
+                self.cancel_all_orders(symbol)
+                self.reset_emergency_state(symbol)
+                self.notifier.send(
+                    f"<b>FORCE CLOSE EXECUTED</b>\n"
+                    f"Symbol: {symbol}\n"
+                    f"Size: {contracts}\n"
+                    f"Reason: SL recreation failed",
+                    urgent=True
+                )
+                return True
+
+
+            logger.error(f"[FORCE CLOSE] Order returned None for {symbol}")
+            return False
+
+
+        except Exception as e:
+            logger.error(f"[FORCE CLOSE] Exception for {symbol}: {e}")
+            return False
+
+
+    def emergency_close(self, symbol: str,
+                         side: Optional[str] = None,
+                         contracts: Optional[float] = None,
+                         reason: str = 'Emergency') -> bool:
+        """
+        Emergency close с circuit breaker.
+
+
+        Если за MAX_EMERGENCY_ATTEMPTS попыток закрыть не удалось —
+        отправляет MANUAL INTERVENTION ALERT и прекращает попытки.
+        Это предотвращает бесконечный цикл из логов.
+
+
+        Возвращает True если закрыто успешно.
+        """
+        attempt = self._emergency_attempts.get(symbol, 0) + 1
+        self._emergency_attempts[symbol] = attempt
+
+
+        logger.critical(
+            f"[EMERGENCY] {symbol} | Attempt {attempt}/{MAX_EMERGENCY_ATTEMPTS} | {reason}"
+        )
+
+
+        if attempt > MAX_EMERGENCY_ATTEMPTS:
+            # Circuit breaker сработал — прекращаем попытки
+            logger.critical(
+                f"[EMERGENCY] CIRCUIT BREAKER: {symbol} — "
+                f"{MAX_EMERGENCY_ATTEMPTS} attempts failed. MANUAL ACTION REQUIRED."
+            )
+            self.notifier.send(
+                f"🚨 <b>CRITICAL: MANUAL INTERVENTION REQUIRED</b>\n"
+                f"Symbol: {symbol}\n"
+                f"Emergency close failed {MAX_EMERGENCY_ATTEMPTS}x\n"
+                f"Reason: {reason}\n"
+                f"<b>CLOSE MANUALLY ON EXCHANGE!</b>",
+                urgent=True
+            )
+            # Убираем из tracking чтобы прекратить цикл мониторинга
+            self.active_sl_orders.pop(symbol, None)
+            self.active_tp_orders.pop(symbol, None)
+            self._emergency_attempts.pop(symbol, None)
+            return False
+
+
+        # Попытка закрыть
+        success = self.force_close_position(symbol, side=side, contracts=contracts)
+
+
+        if success:
+            self.reset_emergency_state(symbol)
+            return True
+
+
+        self.notifier.send(
+            f"<b>EMERGENCY EXIT</b>\n"
+            f"Symbol: {symbol}\n"
+            f"Attempt: {attempt}/{MAX_EMERGENCY_ATTEMPTS}\n"
+            f"Reason: {reason}",
+            urgent=True
+        )
+        return False
+
+
+    def reset_emergency_state(self, symbol: str):
+        """Сбрасывает счётчик emergency попыток после успешного закрытия."""
+        if symbol in self._emergency_attempts:
+            logger.info(f"[EMERGENCY] Reset state for {symbol}")
+            del self._emergency_attempts[symbol]
+
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ПРОВЕРКА СТАТУСОВ
+    # ═══════════════════════════════════════════════════════════════════════
+
+
+    def check_tp_fills(self, symbol: str) -> List[int]:
+        """
+        Проверяет все TP ордера — какие заполнились.
+        Возвращает список индексов заполненных TP (например [0] = TP1 hit).
+        Удаляет заполненные из tracking.
+        """
+        if symbol not in self.active_tp_orders:
+            return []
+
+
+        filled_indices = []
+        remaining      = []
+
+
+        for tp_data in self.active_tp_orders[symbol]:
+            oid      = tp_data['order_id']
+            tp_index = tp_data['tp_index']
+            try:
+                order  = self.exchange.fetch_order(oid, symbol)
+                status = order.get('status', 'unknown')
+
+
+                if status in ('closed', 'filled'):
+                    fill_price = float(
+                        order.get('average') or order.get('price') or tp_data['price']
+                    )
+                    logger.info(f"[TP{tp_index + 1}] FILLED @ ${fill_price:.6f}")
+                    filled_indices.append(tp_index)
+
+
+                elif status in ('canceled', 'cancelled', 'expired'):
+                    logger.warning(f"[TP{tp_index + 1}] Order cancelled/expired: {oid}")
+                    # Не добавляем в remaining — убираем из tracking
+
+
+                else:
+                    remaining.append(tp_data)  # Ещё активен
+
+
+            except Exception as e:
+                logger.error(f"[TP{tp_index + 1}] Error checking order {oid}: {e}")
+                remaining.append(tp_data)  # При ошибке оставляем в tracking
+
+
+        self.active_tp_orders[symbol] = remaining
+        return filled_indices
+
+
+    def check_sl_order_status(self, symbol: str) -> Optional[str]:
+        """
+        Проверяет статус SL ордера.
+        Returns: 'active' | 'filled' | 'canceled' | None
+        """
+        if symbol not in self.active_sl_orders:
+            return None
+
+
+        try:
+            order_data = self.active_sl_orders[symbol]
+            order      = self.exchange.fetch_order(order_data['order_id'], symbol)
+            status     = order.get('status', 'unknown')
+
+
+            if status in ('closed', 'filled'):
+                fill_price = float(
+                    order.get('average') or order.get('price') or order_data['price']
+                )
+                logger.warning(f"[SL] TRIGGERED: {symbol} @ ${fill_price:.6f}")
+                self.notifier.send(
+                    f"<b>STOP LOSS HIT</b>\n"
+                    f"Symbol: {symbol}\n"
+                    f"Price: ${fill_price:.4f}\n"
+                    f"Type: {order_data['type']}",
+                    urgent=True
+                )
+                del self.active_sl_orders[symbol]
+                return 'filled'
+
+
+            elif status in ('canceled', 'cancelled', 'expired'):
+                logger.warning(
+                    f"[SL] Order cancelled/expired for {symbol}: {order_data['order_id']}"
+                )
+                del self.active_sl_orders[symbol]
+                return 'canceled'
+
+
+            return 'active'
+
+
+        except Exception as e:
+            logger.error(f"[SL] Error checking status for {symbol}: {e}")
+            return None  # Не удалили из tracking — попробуем в следующий раз
+
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ОТМЕНА ОРДЕРОВ
+    # ═══════════════════════════════════════════════════════════════════════
+
+
+    def cancel_sl_order(self, symbol: str) -> bool:
+        """
+        Отменяет активный SL ордер.
+
+
+        ФИКС: при ошибке отмены НЕ удаляем из tracking
+        (ордер может всё ещё быть активен на бирже).
+        """
+        if symbol not in self.active_sl_orders:
+            return True
+
+
+        oid = self.active_sl_orders[symbol]['order_id']
+        try:
+            logger.info(f"[SL] Cancelling: {symbol} (ID: {oid})")
+            self.exchange.cancel_order(oid, symbol)
+            del self.active_sl_orders[symbol]
+            logger.info(f"[SL] Cancelled: {symbol}")
+            return True
+        except Exception as e:
+            logger.error(f"[SL] Cancel failed for {symbol} (ID: {oid}): {e}")
+            # НЕ удаляем из tracking — ордер может быть ещё активен
+            return False
+
+
+    def cancel_all_tp_orders(self, symbol: str) -> bool:
+        """
+        Отменяет все TP ордера для символа.
+        Ордера, которые не удалось отменить, остаются в tracking.
+        """
+        if symbol not in self.active_tp_orders:
+            return True
+
+
+        failed = []
+        for tp_data in self.active_tp_orders[symbol]:
+            try:
+                self.exchange.cancel_order(tp_data['order_id'], symbol)
+                logger.info(f"[TP{tp_data['tp_index'] + 1}] Cancelled: {tp_data['order_id']}")
+            except Exception as e:
+                logger.error(f"[TP{tp_data['tp_index'] + 1}] Cancel failed: {e}")
+                failed.append(tp_data)
+
+
+        if failed:
+            self.active_tp_orders[symbol] = failed
+            logger.error(
+                f"[TP] {len(failed)} order(s) NOT cancelled for {symbol}, still tracked!"
+            )
+        else:
+            del self.active_tp_orders[symbol]
+
+
+        return len(failed) == 0
+
+
+    def cancel_all_orders(self, symbol: str) -> bool:
+        """Отменяет SL + все TPs. Вызывается при принудительном закрытии позиции."""
+        logger.info(f"[ORDERS] Cancelling all orders for {symbol}")
+        sl_ok = self.cancel_sl_order(symbol)
+        tp_ok = self.cancel_all_tp_orders(symbol)
+        return sl_ok and tp_ok
+
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # УТИЛИТЫ
+    # ═══════════════════════════════════════════════════════════════════════
+
+
+    def has_sl(self, symbol: str) -> bool:
+        """Есть ли активный SL в tracking для данного символа."""
+        return symbol in self.active_sl_orders
+
+
+    def has_orders(self, symbol: str) -> bool:
+        """Есть ли хоть какие-то ордера (SL или TP) для символа."""
+        return (symbol in self.active_sl_orders
+                or symbol in self.active_tp_orders)
+
+
+    def cleanup_stale_orders(self):
+        """Очищает ордера для уже закрытых позиций."""
+        stale = [
+            sym for sym in list(self.active_sl_orders.keys())
+            if self.check_sl_order_status(sym) in ('filled', 'canceled')
+        ]
+        for sym in stale:
+            self.active_sl_orders.pop(sym, None)
+            self.active_tp_orders.pop(sym, None)
+
+
+        if stale:
+            logger.info(f"[CLEANUP] Removed {len(stale)} stale orders: {stale}")
+
+
+    def get_active_summary(self) -> str:
+        """Возвращает текстовый отчёт об активных ордерах (для дебага)."""
+        lines = ["[ORDERS] Active summary:"]
+        if not self.active_sl_orders and not self.active_tp_orders:
+            lines.append("  (no active orders)")
+            return "\n".join(lines)
+
+
+        for sym, sl in self.active_sl_orders.items():
+            lines.append(
+                f"  SL  {sym}: ${sl['price']:.4f} "
+                f"(type={sl['type']}, id={sl['order_id']})"
+            )
+        for sym, tps in self.active_tp_orders.items():
+            for tp in tps:
+                lines.append(
+                    f"  TP{tp['tp_index'] + 1} {sym}: ${tp['price']:.4f} "
+                    f"x{tp['amount']} (id={tp['order_id']})"
+                )
+        return "\n".join(lines)
+
+# ==================== POSITION TRACKER (🔥 FINAL VERSION WITH SMART ORDER MANAGEMENT) ====================
+class PositionTracker:
+    def __init__(self, exchange: 'ExchangeManager', notifier: 'TelegramNotifier'):
+        self.exchange          = exchange
+        self.notifier          = notifier
+        self.active_positions: Dict = {}
+        self.trailing_data:    Dict = {}
+
+
+        from order_manager import OrderManager
+        self.order_manager = OrderManager(exchange.exchange, notifier)
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    def monitor_positions(self):
+        """
+        Мониторинг позиций.
+        Exchange orders (SL/TP) выполняются биржей автоматически.
+        Бот только:
+          1. Детектирует исполненные TP и обновляет SL (BE / TP1 уровень)
+          2. Следит за тем что SL ордер не пропал
+          3. Очищает закрытые позиции
+        """
+        self.order_manager.cleanup_stale_orders()
+
+
+        positions    = self.exchange.get_positions()
+        open_symbols = set()
+
+
+        for position in positions:
+            symbol    = position['symbol']
+            contracts = float(position['contracts'])
+            if contracts > 0:
+                open_symbols.add(symbol)
+
+
+        # ── Обработка каждой позиции ──────────────────────────────────────
+        for position in positions:
+            symbol    = position['symbol']
+            contracts = float(position['contracts'])
+
+
+            specs             = RiskManager(self.exchange).get_contract_specs(symbol)
+            contract_size     = specs['contract_size']
+            position_size_base = contracts * contract_size
+            base_currency     = symbol.split('/')[0]
+
+
+            # ── Позиция закрылась ──────────────────────────────────────────
+            if contracts == 0:
+                if symbol in self.active_positions:
+                    logger.info(f"[CLOSED] Position {symbol} fully closed")
+                    entry_price = self.active_positions[symbol]['entry_price']
+                    side        = self.active_positions[symbol]['side']
+
+
+                    # Отменяем всё что могло остаться открытым
+                    self.order_manager.cancel_all_orders(symbol)
+                    self.notifier.send(
+                        f"<b>Position Closed</b>\nSymbol: {symbol}\n"
+                        f"Side: {side.upper()}\nEntry: ${entry_price:.4f}",
+                        urgent=False
+                    )
+                    del self.active_positions[symbol]
+                    self.trailing_data.pop(symbol, None)
+                continue
+
+
+            current_price = float(position['markPrice'])
+
+
+            # ── Новая позиция (открыта вручную или бот её не знает) ────────
+            if symbol not in self.active_positions:
+                position_side = position.get('side', 'long')
+                self.active_positions[symbol] = {
+                    'entry_price':  float(position['entryPrice']),
+                    'size':         contracts,
+                    'size_base':    position_size_base,
+                    'side':         position_side,
+                    'tp_hit':       0,
+                    'sl_price':     None,
+                    'sl_type':      'bot_monitoring',  # Не знаем SL
+                    'sl_order_id':  None,
+                    'tp_order_ids': [None, None, None],
+                    'tp_data':      None,
+                    'highest_price': current_price,
+                    'lowest_price':  current_price,
+                    'manually_opened': True
+                }
+                self.notifier.send(
+                    f"<b>Position Detected</b>\nSymbol: {symbol}\n"
+                    f"Side: {position_side.upper()}\nContracts: {contracts:.1f}\n"
+                    f"Entry: ${float(position['entryPrice']):.4f}",
+                    urgent=False
+                )
+                continue
+
+
+            # ── Обновляем размер если изменился (частичный TP) ────────────
+            pos_data = self.active_positions[symbol]
+            old_size = pos_data['size']
+            if abs(contracts - old_size) > 0.001:
+                logger.info(f"[SIZE CHANGE] {symbol}: {old_size} -> {contracts}")
+                self.active_positions[symbol]['size']      = contracts
+                self.active_positions[symbol]['size_base'] = position_size_base
+
+
+            # ── Трекаем high/low ───────────────────────────────────────────
+            if current_price > pos_data.get('highest_price', 0):
+                self.active_positions[symbol]['highest_price'] = current_price
+            if current_price < pos_data.get('lowest_price', float('inf')):
+                self.active_positions[symbol]['lowest_price'] = current_price
+
+
+            # ── ГЛАВНОЕ: Проверяем исполнение TP ордеров на бирже ─────────
+            if pos_data.get('tp_data') and pos_data.get('sl_type') == 'exchange_order':
+                self._check_tp_fills(symbol, position)
+
+
+            # ── Проверяем что SL ордер ещё жив ────────────────────────────
+            self._verify_sl_active(symbol, position)
+
+
+            # ── Fallback: bot-monitoring SL (только для ручных позиций) ────
+            if pos_data.get('sl_type') == 'bot_monitoring' and pos_data.get('sl_price'):
+                self._bot_monitor_sl(symbol, position, contracts, position_size_base, base_currency)
+
+
+        self._cleanup_stale_positions(open_symbols)
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    def _check_tp_fills(self, symbol: str, position: Dict):
+        """
+        Проверяет exchange TP ордера.
+        Если TP1 hit -> SL переносится в BE.
+        Если TP2 hit -> SL переносится на уровень TP1.
+        """
+        filled_tps = self.order_manager.check_tp_fills(symbol)
+
+
+        if not filled_tps:
+            return
+
+
+        pos_data    = self.active_positions[symbol]
+        entry_price = pos_data['entry_price']
+        side        = pos_data['side']
+        tp_prices   = pos_data['tp_data']['prices']
+        new_size    = float(position.get('contracts', pos_data['size']))
+
+
+        for tp_index in sorted(filled_tps):
+            tp_price    = tp_prices[tp_index]
+            profit_pct  = abs(tp_price - entry_price) / entry_price * 100
+            profit_usdt = abs(tp_price - entry_price) * pos_data['size_base'] * pos_data['tp_data']['distribution'][tp_index]
+
+
+            logger.info(f"[TP{tp_index+1}] HIT on exchange: {symbol} @ ${tp_price:.4f}")
+            self.active_positions[symbol]['tp_hit'] = tp_index + 1
+
+
+            self.notifier.send(
+                f"<b>TP{tp_index+1} HIT</b>\n"
+                f"Symbol: {symbol}\n"
+                f"Price: ${tp_price:.4f}\n"
+                f"Profit: +{profit_pct:.2f}% | ${profit_usdt:.2f}\n"
+                f"Remaining: {new_size} contracts",
+                urgent=True
+            )
+
+
+            # ── Обновляем SL в зависимости от TP уровня ───────────────────
+            if new_size > 0:
+                if tp_index == 0:   # TP1 -> Breakeven
+                    new_sl_id = self.order_manager.move_sl_to_breakeven(
+                        symbol, side, entry_price, new_size
+                    )
+                elif tp_index == 1:  # TP2 -> SL на уровень TP1
+                    new_sl_id = self.order_manager.move_sl_to_tp1(
+                        symbol, side, tp_prices[0], new_size
+                    )
+                else:               # TP3 - позиция почти закрыта
+                    new_sl_id = None
+
+
+                if new_sl_id:
+                    self.active_positions[symbol]['sl_order_id'] = new_sl_id
+                    self.active_positions[symbol]['sl_price']    = \
+                        self.order_manager.active_sl_orders.get(symbol, {}).get('price')
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    def _verify_sl_active(self, symbol: str, position: Dict):
+        """
+        Проверяет что SL ордер не пропал с биржи.
+        Если пропал — пересоздаёт.
+        """
+        pos_data   = self.active_positions[symbol]
+        sl_type    = pos_data.get('sl_type', 'bot_monitoring')
+        sl_order_id = pos_data.get('sl_order_id')
+
+
+        if sl_type != 'exchange_order' or not sl_order_id:
+            return
+
+
+        # Проверяем статус
+        if symbol not in self.order_manager.active_sl_orders:
+            # SL не в трекере — проверяем что позиция ещё открыта
+            contracts = float(position.get('contracts', 0))
+            if contracts == 0:
+                return  # Позиция уже закрыта — всё норм
+
+
+            logger.critical(f"[SL MISSING] {symbol} - SL order disappeared! Recreating...")
+            sl_price = pos_data.get('sl_price')
+            side     = pos_data['side']
+            size     = pos_data['size']
+
+
+            if sl_price:
+                new_id = self.order_manager.place_initial_stop_loss(
+                    symbol=symbol, side=side,
+                    position_size=size, sl_price=sl_price
+                )
+                if new_id:
+                    self.active_positions[symbol]['sl_order_id'] = new_id
+                    logger.info(f"[SL RECREATED] {symbol}: {new_id}")
+                    self.notifier.send(
+                        f"<b>SL ORDER RECREATED</b>\n"
+                        f"Symbol: {symbol}\nSL: ${sl_price:.4f}\n"
+                        f"Previous SL disappeared!",
+                        urgent=True
+                    )
+                else:
+                    logger.critical(f"[SL RECREATION FAILED] Force closing {symbol}!")
+                    self.force_close_position(symbol)
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    def _bot_monitor_sl(self, symbol: str, position: Dict,
+                        contracts: float, position_size_base: float, base_currency: str):
+        """
+        Fallback SL для позиций без exchange order (ручные позиции).
+        """
+        pos_data    = self.active_positions[symbol]
+        sl_price    = pos_data['sl_price']
+        side        = pos_data['side']
+        current_price = float(position['markPrice'])
+
+
+        sl_triggered = (
+            (side == 'long'  and current_price <= sl_price) or
+            (side == 'short' and current_price >= sl_price)
+        )
+
+
+        if not sl_triggered:
+            return
+
+
+        try:
+            close_side = 'sell' if side == 'long' else 'buy'
+            logger.error(f"[SL TRIGGER] {symbol} {side.upper()} @ ${current_price:.4f} (SL: ${sl_price:.4f})")
+
+
+            position_side = 'LONG' if side == 'long' else 'SHORT'
+            params = {'marginMode': 'cross', 'positionSide': position_side}
+            order  = self.exchange.exchange.create_order(
+                symbol, 'market', close_side, contracts, params=params
+            )
+
+
+            if order:
+                entry_price = pos_data['entry_price']
+                loss_pct  = (current_price - entry_price) / entry_price * 100 if side == 'long' \
+                            else (entry_price - current_price) / entry_price * 100
+                loss_usdt = abs(current_price - entry_price) * position_size_base
+                self.notifier.send(
+                    f"<b>STOP LOSS EXECUTED (Bot)</b>\n"
+                    f"Symbol: {symbol}\nSide: {side.upper()}\n"
+                    f"Size: {position_size_base:.4f} {base_currency}\n"
+                    f"Entry: ${entry_price:.4f} | Exit: ${current_price:.4f}\n"
+                    f"Loss: {loss_pct:.2f}% | ${loss_usdt:.2f}",
+                    urgent=True
+                )
+
+
+            self.order_manager.cancel_all_orders(symbol)
+            del self.active_positions[symbol]
+            self.trailing_data.pop(symbol, None)
+
+
+        except Exception as e:
+            logger.error(f"[SL EXECUTION FAILED] {symbol}: {e}")
+            self.notifier.send(
+                f"<b>SL Execution Error</b>\nSymbol: {symbol}\n"
+                f"Error: {str(e)[:100]}\nManual intervention required!",
+                urgent=True
+            )
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    def _cleanup_stale_positions(self, open_symbols: set):
+        """Очищает позиции которых нет на бирже."""
+        stale = [s for s in list(self.active_positions.keys()) if s not in open_symbols]
+        if not stale:
+            return
+
+
+        for symbol in stale:
+            pos_data = self.active_positions[symbol]
+            sl_type  = pos_data.get('sl_type', 'bot_monitoring')
+
+
+            if sl_type == 'exchange_order':
+                # Позиция закрылась через SL или TP на бирже
+                current_balance = self.exchange.get_balance()
+                self.notifier.send(
+                    f"<b>Position Closed</b>\n"
+                    f"Symbol: {symbol}\n"
+                    f"Entry: ${pos_data['entry_price']:.4f}\n"
+                    f"Reason: SL hit or TP3\n"
+                    f"Balance: ${current_balance:.2f}",
+                    urgent=False
+                )
+            else:
+                logger.warning(f"[STALE] {symbol} manually closed")
+                self.notifier.send(
+                    f"<b>Position Manually Closed</b>\n"
+                    f"Symbol: {symbol}\nSide: {pos_data['side'].upper()}\n"
+                    f"Entry: ${pos_data['entry_price']:.4f}",
+                    urgent=False
+                )
+
+
+            self.order_manager.cancel_all_orders(symbol)
+            del self.active_positions[symbol]
+            self.trailing_data.pop(symbol, None)
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    def force_close_position(self, symbol: str):
+        """Принудительно закрывает позицию по рынку. FIX: positionSide для Hedge Mode."""
+        try:
+            positions  = self.exchange.get_positions()
+            target_pos = next((p for p in positions
+                            if p['symbol'] == symbol and float(p.get('contracts', 0)) > 0), None)
+
+
+            if not target_pos:
+                logger.warning(f"[FORCE CLOSE] No open position found for {symbol}")
+                return
+
+
+            contracts      = float(target_pos['contracts'])
+            side_str       = target_pos.get('side', 'long')
+            close_side     = 'sell' if side_str == 'long' else 'buy'
+            position_side  = 'LONG' if side_str == 'long' else 'SHORT'  # ✅ FIX
+
+
+            logger.critical(f"[FORCE CLOSE] {symbol}: {contracts} contracts | side={side_str}")
+
+
+            # ✅ FIX: используем create_order напрямую с positionSide
+            params = {'marginMode': 'cross', 'positionSide': position_side}
+            order  = None
+
+
+            for attempt in range(1, 4):  # circuit breaker: макс 3 попытки
+                try:
+                    order = self.exchange.exchange.create_order(
+                        symbol, 'market', close_side, contracts, params=params
+                    )
+                    if order:
+                        break
+                except Exception as attempt_err:
+                    logger.error(f"[FORCE CLOSE] Attempt {attempt}/3 failed: {attempt_err}")
+                    time.sleep(1)
+
+
+            if order:
+                logger.info(f"[FORCE CLOSE] Executed for {symbol}")
+                self.order_manager.cancel_all_orders(symbol)
+                self.active_positions.pop(symbol, None)
+                self.trailing_data.pop(symbol, None)  # чистим трейлинг если есть
+                self.notifier.send(
+                    f"<b>EMERGENCY CLOSE</b>\n"
+                    f"Symbol: {symbol} {position_side}\n"
+                    f"Size: {contracts}\n"
+                    f"Reason: Force closed",
+                    urgent=True
+                )
+            else:
+                logger.error(f"[FORCE CLOSE]  All 3 attempts failed for {symbol}")
+                self.notifier.send(
+                    f"<b>CRITICAL: FORCE CLOSE FAILED</b>\n"
+                    f"Symbol: {symbol}\n"
+                    f"Size: {contracts}\n"
+                    f"MANUAL INTERVENTION REQUIRED!",
+                    urgent=True
+                )
+
+
+        except Exception as e:
+            logger.error(f"[FORCE CLOSE] Critical error: {e}")
+            self.notifier.send(
+                f"<b>CRITICAL ERROR</b>\nSymbol: {symbol}\n"
+                f"Failed to force close!\nMANUAL INTERVENTION REQUIRED!",
+                urgent=True
+        )
+
+# ==================== ENTRY POINT ====================
+if __name__ == "__main__":
+    print("""
+    ╔══════════════════════════════════════════════════════════╗
+    ║                                                          ║
+    ║         AUTONOMOUS TRADING BOT - RECOVERY MODE           ║
+    ║                                                          ║
+    ║  Target: $3 -> $900+                                     ║
+    ║  Strategy: Ultra-selective 50+ score entries            ║
+    ║  Risk: 35% per trade (Aggressive)                       ║
+    ║  Leverage: 20x CROSS                                    ║
+    ║                                                          ║
+    ║  WARNING: HIGH RISK - RECOVERY MODE ACTIVE              ║
+    ║                                                          ║
+    ╚══════════════════════════════════════════════════════════╝
+    """)
+    
+    bot = TradingBot()
+    bot.start()
+
