@@ -1,0 +1,4400 @@
+"""
+FOREX TRADING BOT - MT5 + FxPro
+Dual mode: Auto analysis + Manual Arut signals
+Adapted from crypto futures bot
+Author: Built for Artem
+Date: February 2026
+FIXED VERSION: Improved entry timing + ADX filter + Balanced scoring
+"""
+
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+import time
+import requests
+from datetime import datetime, timedelta
+import json
+import logging
+from typing import Dict, List, Tuple, Optional
+import re
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+import asyncio
+import threading
+from telegram_channel_parser import run_afx_parser
+from momentum_analyzer import MomentumSetupAnalyzer
+
+# ==================== ОПТИМИЗИРОВАННАЯ CONFIGURATION ====================
+class Config:
+    # MT5 Credentials
+    MT5_LOGIN = 540033115
+    MT5_PASSWORD = "ArDan2007&"
+    MT5_SERVER = "FxPro-MT5 Live03"
+
+    # Telegram
+    TELEGRAM_TOKEN = "8574379324:AAGqDEJGrSPEO1_ZWbdJnIxHqHEonkdyAmU"
+    TELEGRAM_CHAT_ID = "1123013458"
+
+    # Trading Pairs
+    TRADING_PAIRS = [
+        "USDCAD",
+        "GBPUSD", 
+        "USDCHF",
+        "EURUSD",
+        "USDJPY",
+        "XAUUSD"
+    ]
+
+    # Risk Management
+    RISK_PER_TRADE = 0.005  # 0.5% на сделку
+    MAX_POSITIONS = 2
+    MAX_POSITIONS_PER_PAIR = 1
+    MAX_MARGIN_USAGE = 0.60 
+    
+    DAILY_LOSS_LIMIT = 0.10 
+    CLOSE_POSITIONS_ON_LOSS_LIMIT = False
+
+    # Score Requirements (СНИЖЕН для большей гибкости)
+    MIN_SCORE = 120  # Было 140 - слишком жестко
+    MIN_RR_RATIO = 2.5
+    MIN_SCORE_MOMENTUM = 90  # Отдельный порог для Momentum (было 120 — слишком строго)
+
+
+    # ATR Filters
+    MIN_ATR_PCT = 0.0004  
+    MAX_ATR_PCT = 0.010  
+
+    # SL Distance
+    MIN_SL_DISTANCE_PCT = 0.0010 
+    MAX_SL_DISTANCE_PCT = 0.015  
+
+    # Session & Volume (КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ)
+    ONLY_ACTIVE_SESSIONS = True 
+    PREFER_OVERLAP = True
+    MIN_VOLUME_RATIO = 0.85  # ИЗМЕНЕНО: 1.5 → 0.85 (критично!)
+    
+    # Дифференцированные пороги по сессиям (рекомендуется добавить)
+    VOLUME_THRESHOLDS = {
+        "LONDON_NY_OVERLAP": 0.90,  # Более высокий для overlap
+        "NEW_YORK": 0.75,            # Ниже для обычной сессии
+        "LONDON": 0.75,
+        "ASIAN": 0.60,               # Самый низкий для азиатской
+        "INACTIVE": 1.5              # Блокировать неактивные периоды
+    }
+
+    # Timeframes
+    MAIN_TIMEFRAME = "M15"
+    HIGHER_TIMEFRAME = "H1"
+
+    # TP/SL Management
+    BREAKEVEN_AFTER_TP1 = True
+    MOVE_SL_TO_TP1_AFTER_TP2 = True
+    CLOSE_ALL_AT_TP3 = True
+
+    # Trading Schedule
+    FRIDAY_CLOSE_HOUR_GMT = 22
+    CLOSE_POSITIONS_BEFORE_WEEKEND = True
+
+    # News filter
+    HIGH_IMPACT_NEWS_HOURS = [
+        (4, 13, 30),  # Friday NFP
+        (2, 18, 0),   # Wednesday FOMC
+    ]
+
+    # Bot behavior
+    SCAN_INTERVAL = 600  # 10 минут
+    COOLDOWN_HOURS = 24
+
+    # AFX Channel Parser
+    TELETHON_API_ID = 20602737
+    TELETHON_API_HASH = "55e5366ae772ad9adb0ffb3af7c111c5"
+    TELETHON_PHONE = "+380683020250"
+    AFX_AUTO_PARSE = True
+
+# ==================== LOGGING ====================
+import sys
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('forex_bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# Disable HTTP logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+# ==================== MT5 CONNECTION ====================
+class MT5Connector:
+    """MetaTrader 5 API wrapper"""
+
+    def __init__(self):
+        self.connected = False
+        self.initialize()
+
+    def initialize(self) -> bool:
+        """Initialize MT5 connection"""
+        try:
+            if not mt5.initialize():
+                logger.error(f"MT5 initialize failed: {mt5.last_error()}")
+                return False
+
+            if not mt5.login(Config.MT5_LOGIN, Config.MT5_PASSWORD, Config.MT5_SERVER):
+                logger.error(f"MT5 login failed: {mt5.last_error()}")
+                return False
+
+            account_info = mt5.account_info()
+            if account_info is None:
+                logger.error("Failed to get account info")
+                return False
+
+            logger.info(f"[OK] MT5 Connected")
+            logger.info(f"  Account: {account_info.login}")
+            logger.info(f"  Server: {account_info.server}")
+            logger.info(f"  Balance: ${account_info.balance:.2f}")
+            logger.info(f"  Equity: ${account_info.equity:.2f}")
+
+            self.connected = True
+            return True
+
+        except Exception as e:
+            logger.error(f"MT5 initialization error: {e}")
+            return False
+
+    def get_balance(self) -> float:
+        """Get account equity"""
+        try:
+            account_info = mt5.account_info()
+            if account_info is None:
+                return 0.0
+            return float(account_info.equity)
+        except Exception as e:
+            logger.error(f"Get balance error: {e}")
+            return 0.0
+
+    def get_symbol_info(self, symbol: str) -> Optional[Dict]:
+        """Get symbol specifications"""
+        try:
+            info = mt5.symbol_info(symbol)
+            if info is None:
+                logger.error(f"Symbol {symbol} not found")
+                return None
+
+            return {
+                'symbol': symbol,
+                'digits': info.digits,
+                'point': info.point,
+                'min_lot': info.volume_min,
+                'max_lot': info.volume_max,
+                'lot_step': info.volume_step,
+                'contract_size': info.trade_contract_size,
+                'tick_value': info.trade_tick_value,
+                'tick_size': info.trade_tick_size,
+            }
+        except Exception as e:
+            logger.error(f"Get symbol info error: {e}")
+            return None
+
+    def get_tick(self, symbol: str) -> Optional[Dict]:
+        """Get current price tick"""
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                return None
+
+            return {
+                'symbol': symbol,
+                'bid': float(tick.bid),
+                'ask': float(tick.ask),
+                'last': float(tick.last),
+                'time': tick.time
+            }
+        except Exception as e:
+            logger.error(f"Get tick error: {e}")
+            return None
+
+    def open_trade(self, symbol: str, direction: str, lot: float,
+                   sl: float, tp: float, comment: str = "") -> Optional[int]:
+        """Open trade with SL/TP"""
+        try:
+            tick = self.get_tick(symbol)
+            if not tick:
+                logger.error(f"Cannot get price for {symbol}")
+                return None
+
+            if direction == "BUY":
+                order_type = mt5.ORDER_TYPE_BUY
+                price = tick['ask']
+            else:
+                order_type = mt5.ORDER_TYPE_SELL
+                price = tick['bid']
+
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": lot,
+                "type": order_type,
+                "price": price,
+                "sl": sl,
+                "tp": tp if tp else 0.0,
+                "deviation": 20,
+                "magic": 234000,
+                "comment": comment,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            logger.info(f"[OPEN TRADE] {symbol} {direction}")
+            logger.info(f"  Lot: {lot}")
+            logger.info(f"  Price: {price:.5f}")
+            logger.info(f"  SL: {sl:.5f}")
+            logger.info(f"  TP: {tp:.5f}" if tp else "  TP: Manual")
+
+            result = mt5.order_send(request)
+
+            if result is None:
+                logger.error(f"order_send failed: {mt5.last_error()}")
+                return None
+
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                logger.error(f"Order failed: {result.retcode} - {result.comment}")
+                return None
+
+            logger.info(f"[OK] Trade opened: Ticket #{result.order}")
+            return result.order
+
+        except Exception as e:
+            logger.error(f"Open trade error: {e}")
+            return None
+
+    def close_trade(self, ticket: int) -> bool:
+        """Close position by ticket"""
+        try:
+            position = mt5.positions_get(ticket=ticket)
+            if not position or len(position) == 0:
+                logger.warning(f"Position {ticket} not found")
+                return False
+
+            pos = position[0]
+            symbol = pos.symbol
+            lot = pos.volume
+
+            if pos.type == mt5.ORDER_TYPE_BUY:
+                order_type = mt5.ORDER_TYPE_SELL
+                price = mt5.symbol_info_tick(symbol).bid
+            else:
+                order_type = mt5.ORDER_TYPE_BUY
+                price = mt5.symbol_info_tick(symbol).ask
+
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": lot,
+                "type": order_type,
+                "position": ticket,
+                "price": price,
+                "deviation": 20,
+                "magic": 234000,
+                "comment": "close",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            result = mt5.order_send(request)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                logger.error(f"Close failed: {result.retcode}")
+                return False
+
+            logger.info(f"[OK] Position closed: #{ticket}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Close trade error: {e}")
+            return False
+
+    def modify_sl_tp(self, ticket: int, new_sl: float, new_tp: float = None) -> bool:
+        """Modify SL/TP of existing position"""
+        try:
+            position = mt5.positions_get(ticket=ticket)
+            if not position or len(position) == 0:
+                logger.warning(f"Position {ticket} not found")
+                return False
+
+            pos = position[0]
+
+            if new_tp is None:
+                new_tp = pos.tp
+
+            request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": ticket,
+                "sl": new_sl,
+                "tp": new_tp,
+            }
+
+            result = mt5.order_send(request)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                logger.error(f"Modify SL/TP failed: {result.retcode}")
+                return False
+
+            logger.info(f"[OK] SL/TP modified: #{ticket} → SL={new_sl:.5f}, TP={new_tp:.5f}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Modify SL/TP error: {e}")
+            return False
+
+    def get_positions(self) -> List[Dict]:
+        """Get all open positions"""
+        try:
+            positions = mt5.positions_get()
+            if positions is None:
+                return []
+
+            result = []
+            for pos in positions:
+                result.append({
+                    'ticket': pos.ticket,
+                    'symbol': pos.symbol,
+                    'type': 'BUY' if pos.type == mt5.ORDER_TYPE_BUY else 'SELL',
+                    'volume': pos.volume,
+                    'open_price': pos.price_open,
+                    'current_price': pos.price_current,
+                    'sl': pos.sl,
+                    'tp': pos.tp,
+                    'profit': pos.profit,
+                    'swap': pos.swap,
+                    'comment': pos.comment,
+                    'time': pos.time,
+                })
+            return result
+
+        except Exception as e:
+            logger.error(f"Get positions error: {e}")
+            return []
+
+    def get_ohlcv(self, symbol: str, timeframe: str, bars: int = 500) -> pd.DataFrame:
+        """Get OHLCV data"""
+        try:
+            tf_map = {
+                "M1": mt5.TIMEFRAME_M1,
+                "M5": mt5.TIMEFRAME_M5,
+                "M15": mt5.TIMEFRAME_M15,
+                "M30": mt5.TIMEFRAME_M30,
+                "H1": mt5.TIMEFRAME_H1,
+                "H4": mt5.TIMEFRAME_H4,
+                "D1": mt5.TIMEFRAME_D1,
+            }
+
+            if timeframe not in tf_map:
+                logger.error(f"Unknown timeframe: {timeframe}")
+                return pd.DataFrame()
+
+            rates = mt5.copy_rates_from_pos(symbol, tf_map[timeframe], 0, bars)
+            if rates is None or len(rates) == 0:
+                logger.error(f"No data for {symbol} {timeframe}")
+                return pd.DataFrame()
+
+            df = pd.DataFrame(rates)
+            df['time'] = pd.to_datetime(df['time'], unit='s')
+            return df[['time', 'open', 'high', 'low', 'close', 'tick_volume']]
+
+        except Exception as e:
+            logger.error(f"Get OHLCV error: {e}")
+            return pd.DataFrame()
+
+def open_limit_order(self, symbol: str, direction: str, lot: float,
+                     price: float, sl: float, tp: float,
+                     comment: str = "", expiry_hours: int = 48) -> Optional[int]:
+    """Place pending LIMIT order at exact price"""
+    try:
+        if direction == "BUY":
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT
+        else:
+            order_type = mt5.ORDER_TYPE_SELL_LIMIT
+
+        expiration = datetime.utcnow() + timedelta(hours=expiry_hours)
+
+        request = {
+            "action":      mt5.TRADE_ACTION_PENDING,
+            "symbol":      symbol,
+            "volume":      lot,
+            "type":        order_type,
+            "price":       price,
+            "sl":          sl,
+            "tp":          tp if tp else 0.0,
+            "deviation":   20,
+            "magic":       234000,
+            "comment":     comment,
+            "type_time":   mt5.ORDER_TIME_SPECIFIED,
+            "expiration":  int(expiration.timestamp()),
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        }
+
+        logger.info(f"[LIMIT ORDER] {symbol} {direction}")
+        logger.info(f"  Price: {price:.5f} | SL: {sl:.5f} | TP: {tp:.5f}")
+        logger.info(f"  Lot: {lot} | Expires in {expiry_hours}h")
+
+        result = mt5.order_send(request)
+
+        if result is None:
+            logger.error(f"order_send failed: {mt5.last_error()}")
+            return None
+
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"Limit order failed: {result.retcode} - {result.comment}")
+            return None
+
+        logger.info(f"[OK] Limit order placed: Ticket #{result.order}")
+        return result.order
+
+    except Exception as e:
+        logger.error(f"Open limit order error: {e}")
+        return None
+
+
+# ==================== TELEGRAM NOTIFIER ====================
+class TelegramNotifier:
+    """Telegram notifications + manual signal parsing"""
+
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{token}/sendMessage"
+        self.pending_signals = {}
+
+    def send(self, message: str, urgent: bool = False):
+        """Send notification"""
+        try:
+            emoji = "🚨" if urgent else "ℹ️"
+            full_message = f"{emoji} {message}"
+
+            payload = {
+                'chat_id': self.chat_id,
+                'text': full_message,
+                'parse_mode': 'HTML'
+            }
+
+            response = requests.post(self.base_url, data=payload, timeout=10)
+            if response.status_code != 200:
+                logger.error(f"Telegram send failed: {response.text}")
+        except Exception as e:
+            logger.error(f"Telegram error: {e}")
+
+    def send_with_buttons(self, message: str, buttons: List[Tuple[str, str]]):
+        """Send message with inline buttons"""
+        try:
+            keyboard = [[InlineKeyboardButton(text, callback_data=data)] for text, data in buttons]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            payload = {
+                'chat_id': self.chat_id,
+                'text': message,
+                'reply_markup': json.dumps(reply_markup.to_dict()),
+                'parse_mode': 'HTML'
+            }
+
+            requests.post(url, data=payload, timeout=10)
+        except Exception as e:
+            logger.error(f"Send buttons error: {e}")
+
+    def parse_arut_signal(self, text: str) -> Optional[Dict]:
+        """Parse Arut signal format"""
+        try:
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
+            if len(lines) < 4:
+                return None
+
+            first_line = lines[0].upper()
+            if 'BUY' in first_line:
+                direction = 'BUY'
+            elif 'SELL' in first_line:
+                direction = 'SELL'
+            else:
+                return None
+
+            symbol = None
+            for pair in Config.TRADING_PAIRS:
+                if pair in first_line:
+                    symbol = pair
+                    break
+
+            if not symbol:
+                return None
+
+            entry_line = lines[1]
+            entry_match = re.findall(r'\d+\.\d+', entry_line)
+            if len(entry_match) >= 1:
+                entry_price = float(entry_match[0])
+            else:
+                return None
+
+            tp1 = tp2 = tp3 = None
+            sl = None
+
+            for line in lines[2:]:
+                line_upper = line.upper()
+                prices = re.findall(r'\d+\.\d+', line)
+                if not prices:
+                    continue
+
+                price = float(prices[0])
+
+                if 'TAKE PROFIT 1' in line_upper or 'TP1' in line_upper or 'TP 1' in line_upper:
+                    tp1 = price
+                elif 'TAKE PROFIT 2' in line_upper or 'TP2' in line_upper or 'TP 2' in line_upper:
+                    tp2 = price
+                elif 'TAKE PROFIT 3' in line_upper or 'TP3' in line_upper or 'TP 3' in line_upper:
+                    tp3 = price
+                elif 'STOP LOSS' in line_upper or 'SL' in line_upper:
+                    sl = price
+
+            if not sl:
+                return None
+
+            return {
+                'symbol': symbol,
+                'direction': direction,
+                'entry': entry_price,
+                'tp1': tp1,
+                'tp2': tp2,
+                'tp3': tp3,
+                'sl': sl,
+                'source': 'ARUT'
+            }
+
+        except Exception as e:
+            logger.error(f"Parse signal error: {e}")
+            return None
+
+# ==================== 🆕 SESSION FILTER ====================
+class SessionFilter:
+    """Фильтр активных торговых сессий"""
+    
+    @staticmethod
+    def get_current_session() -> Dict:
+        """Определить текущую сессию (GMT)"""
+        try:
+            now = datetime.utcnow()
+            hour = now.hour
+            weekday = now.weekday()
+            
+            # Выходные
+            if weekday == 5 or (weekday == 6 and hour < 22):
+                return {
+                    'session': 'WEEKEND_CLOSED',
+                    'active': False,
+                    'score_modifier': -50,
+                    'description': '⛔ Weekend - Market closed'
+                }
+            
+            # Пятница после 21:00 GMT
+            if weekday == 4 and hour >= 21:
+                return {
+                    'session': 'FRIDAY_CLOSE',
+                    'active': False,
+                    'score_modifier': -30,
+                    'description': '⚠️ Friday close - Low liquidity'
+                }
+            
+            # Overlap Лондон + Нью-Йорк (ЛУЧШЕЕ ВРЕМЯ!)
+            if 13 <= hour < 17:  # 13:00-17:00 GMT
+                return {
+                    'session': 'LONDON_NY_OVERLAP',
+                    'active': True,
+                    'score_modifier': 20,
+                    'description': '🔥 London-NY Overlap - BEST TIME'
+                }
+            
+            # Лондонская сессия (8:00-17:00 GMT)
+            if 8 <= hour < 17:
+                return {
+                    'session': 'LONDON',
+                    'active': True,
+                    'score_modifier': 10,
+                    'description': '✅ London Session - High liquidity'
+                }
+            
+            # Нью-Йорк (13:00-22:00 GMT)
+            if 13 <= hour < 22:
+                return {
+                    'session': 'NEW_YORK',
+                    'active': True,
+                    'score_modifier': 10,
+                    'description': '✅ New York Session - Active'
+                }
+            
+            # Азиатская сессия / мертвые часы
+            return {
+                'session': 'ASIAN_OR_QUIET',
+                'active': False,
+                'score_modifier': -30,
+                'description': '⚠️ Asian/Quiet hours - Low volume'
+            }
+            
+        except Exception as e:
+            logger.error(f"Session filter error: {e}")
+            return {
+                'session': 'UNKNOWN',
+                'active': True,
+                'score_modifier': 0,
+                'description': 'Unknown session'
+            }
+    
+    @staticmethod
+    def can_trade_now() -> Tuple[bool, str]:
+        """Можно ли торговать сейчас"""
+        session_info = SessionFilter.get_current_session()
+        return session_info['active'], session_info.get('description', 'N/A')
+    
+    @staticmethod
+    def check_volume_confirmation(df: pd.DataFrame, min_ratio: float = 1.2) -> Tuple[bool, float]:
+        """Проверка объема для подтверждения сигнала"""
+        try:
+            if len(df) < 20:
+                return False, 0.0
+            
+            current_volume = df['tick_volume'].iloc[-1]
+            avg_volume = df['tick_volume'].iloc[-20:-1].mean()
+            
+            if avg_volume == 0:
+                return False, 0.0
+            
+            volume_ratio = current_volume / avg_volume
+            
+            if volume_ratio >= min_ratio:
+                return True, volume_ratio
+            
+            return False, volume_ratio
+            
+        except Exception as e:
+            logger.error(f"Volume check error: {e}")
+            return False, 0.0
+
+
+# ==================== RISK MANAGER ====================
+class RiskManager:
+    """Calculate position size, SL/TP levels with FREE MARGIN check"""
+
+    def __init__(self, mt5: MT5Connector):
+        self.mt5 = mt5
+
+    # ──────────────────────────────────────────────────
+    # MARGIN HELPERS
+    # ──────────────────────────────────────────────────
+
+    def get_free_margin(self) -> float:
+        """Получить СВОБОДНУЮ маржу (не баланс!)"""
+        try:
+            account_info = mt5.account_info()
+            if account_info is None:
+                logger.error("Cannot get account info")
+                return 0.0
+
+            free_margin  = float(account_info.margin_free)
+            equity       = float(account_info.equity)
+            margin_level = float(account_info.margin_level) if account_info.margin_level else 0
+
+            logger.info(f"[MARGIN INFO]")
+            logger.info(f"  Equity: ${equity:.2f}")
+            logger.info(f"  Free Margin: ${free_margin:.2f}")
+            logger.info(f"  Margin Level: {margin_level:.1f}%")
+
+            return free_margin
+
+        except Exception as e:
+            logger.error(f"Get free margin error: {e}")
+            return 0.0
+
+    def can_open_position(self, required_margin: float) -> Tuple[bool, str]:
+        """Проверка доступности маржи ПЕРЕД открытием"""
+        try:
+            free_margin      = self.get_free_margin()
+            max_usage        = Config.MAX_MARGIN_USAGE           # e.g. 0.70
+            available_margin = free_margin * max_usage
+
+            if required_margin > available_margin:
+                return False, f"Not enough margin: ${required_margin:.2f} > ${available_margin:.2f}"
+
+            if required_margin > free_margin * 0.90:
+                return True, f"⚠️ High margin usage: {(required_margin / free_margin) * 100:.1f}%"
+
+            return True, "OK"
+
+        except Exception as e:
+            logger.error(f"Margin check error: {e}")
+            return False, str(e)
+
+    # ──────────────────────────────────────────────────
+    # LOT CALCULATION
+    # ──────────────────────────────────────────────────
+
+    def calculate_lot_size(
+        self, symbol: str, entry: float, sl: float,
+        balance: float, risk_pct: float = 0.01
+    ) -> float:
+        """Calculate lot size based on risk with FREE MARGIN validation"""
+        try:
+            logger.info(f"[LOT CALCULATION] {symbol}")
+
+            account_info = mt5.account_info()
+            if account_info:
+                equity = float(account_info.equity)
+                logger.info(f"  Equity: ${equity:.2f}")
+            else:
+                equity = balance
+                logger.info(f"  Balance: ${balance:.2f}")
+
+            risk_amount = equity * risk_pct
+            logger.info(f"  Risk: {risk_pct * 100:.1f}% = ${risk_amount:.2f}")
+            logger.info(f"  Entry: {entry:.5f}, SL: {sl:.5f}")
+
+            symbol_info = mt5.symbol_info(symbol)
+            if not symbol_info:
+                logger.error(f"Symbol {symbol} not found")
+                return 0.0
+
+            sl_distance   = abs(entry - sl)
+            tick_size     = symbol_info.trade_tick_size
+            tick_value    = symbol_info.trade_tick_value
+            contract_size = symbol_info.trade_contract_size
+            min_lot       = symbol_info.volume_min
+            max_lot       = symbol_info.volume_max
+            lot_step      = symbol_info.volume_step
+
+            logger.info(f"  Distance: {sl_distance:.5f}")
+            logger.info(f"  Tick size: {tick_size}, Tick value: ${tick_value:.2f}")
+            logger.info(f"  Contract size: {contract_size}")
+
+            ticks        = sl_distance / tick_size
+            money_per_lot = ticks * tick_value
+
+            if money_per_lot == 0:
+                logger.error("Money per lot = 0")
+                return 0.0
+
+            raw_lot = risk_amount / money_per_lot
+            logger.info(f"  Ticks: {ticks:.0f}, Money per lot: ${money_per_lot:.2f}")
+            logger.info(f"  Raw lot: {raw_lot:.4f}")
+
+            lot = round(raw_lot / lot_step) * lot_step
+            lot = max(min_lot, min(lot, max_lot))
+
+            # ── Проверка маржи ──
+            order_type = mt5.ORDER_TYPE_SELL if sl > entry else mt5.ORDER_TYPE_BUY
+            margin     = mt5.order_calc_margin(order_type, symbol, lot, entry)
+
+            if margin is None:
+                logger.warning(f"  Cannot calculate margin, using lot {lot:.2f}")
+            else:
+                logger.info(f"  Required margin: ${margin:.2f}")
+
+                can_open, reason = self.can_open_position(margin)
+
+                if not can_open:
+                    logger.error(f"  [BLOCKED] {reason}")
+
+                    free_margin = self.get_free_margin()
+                    if free_margin > 0 and margin > 0:
+                        reduced_lot = (free_margin * Config.MAX_MARGIN_USAGE) / (margin / lot)
+                        reduced_lot = max(min_lot, round(reduced_lot / lot_step) * lot_step)
+
+                        if reduced_lot >= min_lot:
+                            logger.info(f"  [REDUCED] Lot from {lot:.2f} to {reduced_lot:.2f}")
+                            lot = reduced_lot
+                        else:
+                            logger.error("  [REJECTED] Cannot reduce lot enough")
+                            return 0.0
+                    else:
+                        return 0.0
+                else:
+                    if "⚠️" in reason:
+                        logger.warning(f"  {reason}")
+
+            logger.info(f"  [FINAL] Lot: {lot:.2f}")
+            return lot
+
+        except Exception as e:
+            logger.error(f"Calculate lot error: {e}")
+            return 0.0
+
+    # ──────────────────────────────────────────────────
+    # SL VALIDATION
+    # ──────────────────────────────────────────────────
+
+    def validate_sl_distance(self, entry: float, sl: float, symbol: str = None) -> bool:
+        """Check if SL distance is valid"""
+        try:
+            distance_pct = abs(entry - sl) / entry
+
+            if symbol and symbol in ['GOLD', 'XAUUSD', 'XAGUSD']:
+                min_sl     = 0.001
+                max_sl     = 0.015
+                asset_name = "GOLD"
+            else:
+                min_sl     = Config.MIN_SL_DISTANCE_PCT
+                max_sl     = Config.MAX_SL_DISTANCE_PCT
+                asset_name = "Forex"
+
+            tolerance = 0.98    # 2% tolerance
+
+            if distance_pct < min_sl * tolerance:
+                logger.warning(
+                    f"SL too close: {distance_pct * 100:.2f}% < {min_sl * 100:.2f}% ({asset_name} limit)"
+                )
+                return False
+
+            if distance_pct > max_sl * 1.02:
+                logger.warning(
+                    f"SL too far: {distance_pct * 100:.2f}% > {max_sl * 100:.2f}% ({asset_name} limit)"
+                )
+                return False
+
+            logger.info(f"  [SL OK] {distance_pct * 100:.2f}% (within {asset_name} range)")
+            return True
+
+        except Exception as e:
+            logger.error(f"Validate SL error: {e}")
+            return False
+
+    # ──────────────────────────────────────────────────
+    # DYNAMIC SL
+    # ──────────────────────────────────────────────────
+
+    def calculate_dynamic_sl(self, df: pd.DataFrame, direction: str, entry: float) -> float:
+        """Calculate SL based on ATR"""
+        try:
+            if len(df) < 20:
+                return entry * 0.992 if direction == 'BUY' else entry * 1.008
+
+            high  = df['high']
+            low   = df['low']
+            close = df['close']
+
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(window=14).mean().iloc[-1]
+
+            sl_distance = atr * 4.0
+            min_distance = entry * Config.MIN_SL_DISTANCE_PCT
+            max_distance = entry * Config.MAX_SL_DISTANCE_PCT
+            sl_distance  = max(min_distance, min(sl_distance, max_distance))
+
+            sl = entry - sl_distance if direction == 'BUY' else entry + sl_distance
+
+            logger.info(f"[DYNAMIC SL] ATR={atr:.5f}, Distance={sl_distance:.5f}, SL={sl:.5f}")
+            return sl
+
+        except Exception as e:
+            logger.error(f"Dynamic SL error: {e}")
+            return entry * 0.992 if direction == 'BUY' else entry * 1.008
+
+# ==================== PROFESSIONAL FOREX ANALYZER WITH SMC ====================
+class ForexAnalyzer:
+    """
+    Smart Money Concepts для Forex с многотаймфреймовым анализом
+    
+    🆕 УЛУЧШЕНИЯ (Feb 2026):
+    - BOS (Break of Structure) confirmation на M15
+    - Immediate momentum check перед входом
+    - Trailing stop management для защиты прибыли
+    - Ужесточенный начальный SL (ATR x2 вместо x4)
+    
+    Адаптировано из крипто-бота - профессиональная методология:
+    - Weekly levels (PWL/PWH)
+    - RSI divergence
+    - Daily rejection
+    - 4H fractal inducement
+    - StB/BtS манипуляции
+    - Liquidity pools
+    - Consolidation detection
+    - Multi-timeframe scoring
+    """
+
+    def __init__(self):
+        self.mt5 = None  # Будет передан позже
+
+    # ==================== БАЗОВЫЕ ИНДИКАТОРЫ ====================
+
+    def calculate_rsi(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate RSI"""
+        try:
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return rsi
+        except:
+            return pd.Series([50.0] * len(df))
+
+    def calculate_atr_pct(self, df: pd.DataFrame) -> float:
+        """Calculate ATR as percentage"""
+        try:
+            high = df['high']
+            low = df['low']
+            close = df['close']
+
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(window=14).mean().iloc[-1]
+
+            atr_pct = atr / close.iloc[-1]
+            return atr_pct
+        except Exception as e:
+            logger.error(f"ATR calculation error: {e}")
+            return 0.0
+
+    def calculate_atr_from_df(self, df: pd.DataFrame) -> float:
+        """🆕 Helper: Calculate raw ATR value (for trailing stop)"""
+        try:
+            high = df['high']
+            low = df['low']
+            close = df['close']
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(window=14).mean().iloc[-1]
+            return float(atr)
+        except:
+            return 0.0
+
+    def calculate_adx(self, df: pd.DataFrame, period: int = 14) -> float:
+        """Calculate ADX"""
+        try:
+            if len(df) < 50:
+                return 0.0
+
+            close = df['close']
+            high = df['high']
+            low = df['low']
+
+            high_diff = high.diff()
+            low_diff = -low.diff()
+
+            plus_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
+            minus_dm = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
+
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+            atr = tr.rolling(window=period).mean()
+            plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+            minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+
+            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+            adx = dx.rolling(window=period).mean().iloc[-1]
+
+            return adx
+        except Exception as e:
+            logger.error(f"ADX calculation error: {e}")
+            return 0.0
+
+    def detect_market_regime(self, df: pd.DataFrame) -> str:
+        """Detect if market is TRENDING or RANGING using ADX"""
+        try:
+            adx = self.calculate_adx(df, 14)
+
+            if adx > 25:
+                return 'TRENDING'
+            elif adx > 15:
+                return 'WEAK_TREND'
+            else:
+                return 'RANGING'
+        except Exception as e:
+            logger.error(f"Market regime detection error: {e}")
+            return 'UNKNOWN'
+
+    def detect_trend(self, df: pd.DataFrame) -> Tuple[str, float]:
+        """Detect trend using EMAs and measure price distance from EMA20"""
+        try:
+            if len(df) < 50:
+                return 'NEUTRAL', 0.0
+
+            ema_20 = df['close'].ewm(span=20, adjust=False).mean().iloc[-1]
+            ema_50 = df['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+            current_price = df['close'].iloc[-1]
+
+            distance_pct = abs(current_price - ema_20) / ema_20
+
+            if current_price > ema_20 and ema_20 > ema_50:
+                return 'BULLISH', distance_pct
+            if current_price < ema_20 and ema_20 < ema_50:
+                return 'BEARISH', distance_pct
+
+            return 'NEUTRAL', distance_pct
+        except Exception as e:
+            logger.error(f"Trend detection error: {e}")
+            return 'NEUTRAL', 0.0
+
+    # ==================== 🆕 BOS CONFIRMATION ====================
+
+    def confirm_bos_entry(self, df_15m: pd.DataFrame, direction: str) -> Tuple[bool, str]:
+        """
+        🆕 Break of Structure confirmation - вход ТОЛЬКО после подтверждения
+        
+        Для LONG:
+        - Цена пробила предыдущий хай
+        - Сформировался higher high
+        - Текущая свеча закрылась выше пробитого уровня
+        - Минимум 2 из 3 последних свечей бычьи
+        
+        Для SHORT:
+        - Цена пробила предыдущий лоу
+        - Сформировался lower low
+        - Текущая свеча закрылась ниже пробитого уровня
+        - Минимум 2 из 3 последних свечей медвежьи
+        """
+        try:
+            if len(df_15m) < 20:
+                return False, "Not enough data"
+            
+            recent = df_15m.iloc[-15:].copy()
+            
+            if direction == 'LONG':
+                # Найти последние swing highs
+                swing_highs = []
+                for i in range(2, len(recent) - 1):
+                    if (recent.iloc[i]['high'] > recent.iloc[i-1]['high'] and 
+                        recent.iloc[i]['high'] > recent.iloc[i-2]['high'] and
+                        recent.iloc[i]['high'] > recent.iloc[i+1]['high']):
+                        swing_highs.append((i, recent.iloc[i]['high']))
+                
+                if len(swing_highs) < 2:
+                    return False, "No swing structure"
+                
+                # Последний хай должен быть выше предыдущего (Higher High)
+                prev_high = swing_highs[-2][1]
+                last_high = swing_highs[-1][1]
+                current_close = recent.iloc[-1]['close']
+                
+                # BOS = текущая цена ВЫШЕ предыдущего хая
+                if current_close > prev_high and last_high > prev_high:
+                    # Проверка momentum: последние 2-3 свечи бычьи
+                    last_3_candles = recent.iloc[-3:]['close'] - recent.iloc[-3:]['open']
+                    bullish_candles = (last_3_candles > 0).sum()
+                    
+                    if bullish_candles >= 2:
+                        return True, f"BOS HH {last_high:.5f} > {prev_high:.5f}"
+                    else:
+                        return False, "BOS but weak candles"
+                
+                return False, f"No BOS: {current_close:.5f} < {prev_high:.5f}"
+            
+            else:  # SHORT
+                # Найти последние swing lows
+                swing_lows = []
+                for i in range(2, len(recent) - 1):
+                    if (recent.iloc[i]['low'] < recent.iloc[i-1]['low'] and 
+                        recent.iloc[i]['low'] < recent.iloc[i-2]['low'] and
+                        recent.iloc[i]['low'] < recent.iloc[i+1]['low']):
+                        swing_lows.append((i, recent.iloc[i]['low']))
+                
+                if len(swing_lows) < 2:
+                    return False, "No swing structure"
+                
+                prev_low = swing_lows[-2][1]
+                last_low = swing_lows[-1][1]
+                current_close = recent.iloc[-1]['close']
+                
+                # BOS = текущая цена НИЖЕ предыдущего лоу
+                if current_close < prev_low and last_low < prev_low:
+                    last_3_candles = recent.iloc[-3:]['close'] - recent.iloc[-3:]['open']
+                    bearish_candles = (last_3_candles < 0).sum()
+                    
+                    if bearish_candles >= 2:
+                        return True, f"BOS LL {last_low:.5f} < {prev_low:.5f}"
+                    else:
+                        return False, "BOS but weak candles"
+                
+                return False, f"No BOS: {current_close:.5f} > {prev_low:.5f}"
+        
+        except Exception as e:
+            logger.error(f"BOS confirmation error: {e}")
+            return False, str(e)
+
+    # ==================== 🆕 IMMEDIATE MOMENTUM CHECK ====================
+
+    def check_immediate_momentum(self, df_15m: pd.DataFrame, direction: str) -> Tuple[bool, float]:
+        """
+        Проверка импульса на M15 прямо сейчас.
+
+        ✅ v3.0 — синхронизированы пороги RSI с momentum_analyzer_v3:
+          SHORT: RSI на M15 должен быть в диапазоне 30–62
+                 < 30 → слишком перепродан, SHORT на истощении = стоп-хант
+                 > 62 → перекуплен на M15, импульс ещё не начался вниз
+          LONG:  RSI на M15 должен быть в диапазоне 38–70
+                 > 70 → перекуплен, поздний вход
+                 < 38 → перепродан, нет ещё роста
+
+        Было (v2.1):
+          SHORT: 25 < RSI < 55  — разрешал RSI=44 (кейс GBPUSD)
+          LONG:  45 < RSI < 75  — слишком широко
+
+        Добавлен RSI HARD BLOCK для M15:
+          SHORT: RSI < 28 → немедленный False (momentum exhausted)
+          LONG:  RSI > 72 → немедленный False
+        """
+        try:
+            if len(df_15m) < 20:
+                return False, 0.0
+
+            # ─── 1. Свечной анализ (последние 3 свечи) ───────────────
+            last_3       = df_15m.iloc[-3:].copy()
+            body_size    = (last_3['close'] - last_3['open']).abs().mean()
+            candle_range = (last_3['high'] - last_3['low']).mean()
+
+            if direction == 'LONG':
+                direction_count = (last_3['close'] > last_3['open']).sum()
+                if direction_count < 2:
+                    return False, 0.0
+            else:  # SHORT
+                direction_count = (last_3['close'] < last_3['open']).sum()
+                if direction_count < 2:
+                    return False, 0.0
+
+            # Body > 40% range (не пины, реальный импульс)
+            if candle_range > 0 and body_size < candle_range * 0.4:
+                return False, 0.0
+
+            # ─── 2. RSI M15 — синхронизировано с v3.0 ────────────────
+            rsi = float(self.calculate_rsi(df_15m, 14).iloc[-1])
+
+            if direction == 'LONG':
+                # ✅ Допустимая зона: RSI 38–70
+                # RSI < 38 → слишком низко, нет бычьего импульса ещё
+                # RSI > 72 → перекуплен, поздний вход
+                if rsi < 38:
+                    return False, 0.0
+                if rsi > 72:
+                    return False, 0.0
+            else:  # SHORT
+                # ✅ Допустимая зона: RSI 30–62
+                # RSI < 28 → HARD BLOCK: momentum exhausted (кейс EURUSD RSI=18.4)
+                # RSI > 62 → импульс вниз ещё не начался
+                if rsi < 28:
+                    logger.warning(
+                        f"[MOMENTUM] ⛔ M15 RSI HARD BLOCK SHORT: RSI={rsi:.1f} < 28 "
+                        f"(momentum exhausted)"
+                    )
+                    return False, 0.0
+                if rsi > 62:
+                    return False, 0.0
+
+            # ─── 3. Объём ≥ 1.2x среднего ────────────────────────────
+            current_volume = df_15m['tick_volume'].iloc[-1]
+            avg_volume     = df_15m['tick_volume'].iloc[-20:-1].mean()
+            volume_ratio   = current_volume / avg_volume if avg_volume > 0 else 1.0
+
+            if volume_ratio < 1.2:
+                return False, 0.0
+
+            # ─── Momentum score (0–100) ───────────────────────────────
+            momentum_score = min(100, direction_count * 25 + volume_ratio * 15)
+
+            return True, momentum_score
+
+        except Exception as e:
+            logger.error(f"Momentum check error: {e}")
+            return False, 0.0
+
+
+    # ==================== 🆕 TRAILING STOP MANAGEMENT ====================
+
+    def manage_trailing_stop(self, ticket: int, position: Dict, df_15m: pd.DataFrame) -> bool:
+        """
+        🆕 Динамический trailing stop после движения в прибыль
+        
+        Логика (3 уровня защиты):
+        - Если профит > 0.3% → переводим в breakeven
+        - Если профит > 0.6% → trailing stop на ATR x1.5 от текущей цены
+        - Если профит > 1.0% → trailing stop на ATR x1.0 (очень плотно)
+        """
+        try:
+            current_price = position['current_price']
+            entry_price = position['open_price']
+            direction = position['type']
+            current_sl = position['sl']
+            
+            # Расчет текущей прибыли в %
+            if direction == 'BUY':
+                profit_pct = (current_price - entry_price) / entry_price
+            else:
+                profit_pct = (entry_price - current_price) / entry_price
+            
+            logger.info(f"[TRAILING SL] Ticket #{ticket} | Profit: {profit_pct*100:.2f}%")
+            
+            # ATR для расчета дистанции
+            atr = self.calculate_atr_from_df(df_15m)
+            if atr == 0:
+                logger.warning(f"  Cannot calculate ATR - skipping")
+                return False
+            
+            new_sl = None
+            
+            # Level 1: Breakeven (0.3% profit)
+            if profit_pct > 0.003:
+                if direction == 'BUY':
+                    if current_sl < entry_price:
+                        new_sl = entry_price + 0.0001  # Чуть выше breakeven
+                        logger.info(f"  → Moving to BREAKEVEN: {new_sl:.5f}")
+                else:
+                    if current_sl > entry_price:
+                        new_sl = entry_price - 0.0001
+                        logger.info(f"  → Moving to BREAKEVEN: {new_sl:.5f}")
+            
+            # Level 2: Tight trailing (0.6% profit)
+            if profit_pct > 0.006:
+                if direction == 'BUY':
+                    tight_sl = current_price - (atr * 1.5)
+                    if tight_sl > current_sl:
+                        new_sl = tight_sl
+                        logger.info(f"  → TIGHT TRAILING: {new_sl:.5f} (ATR x1.5)")
+                else:
+                    tight_sl = current_price + (atr * 1.5)
+                    if tight_sl < current_sl:
+                        new_sl = tight_sl
+                        logger.info(f"  → TIGHT TRAILING: {new_sl:.5f} (ATR x1.5)")
+            
+            # Level 3: Very tight trailing (1.0% profit)
+            if profit_pct > 0.010:
+                if direction == 'BUY':
+                    very_tight_sl = current_price - (atr * 1.0)
+                    if very_tight_sl > current_sl:
+                        new_sl = very_tight_sl
+                        logger.info(f"  → VERY TIGHT TRAILING: {new_sl:.5f} (ATR x1.0)")
+                else:
+                    very_tight_sl = current_price + (atr * 1.0)
+                    if very_tight_sl < current_sl:
+                        new_sl = very_tight_sl
+                        logger.info(f"  → VERY TIGHT TRAILING: {new_sl:.5f} (ATR x1.0)")
+            
+            # Применить новый SL
+            if new_sl and new_sl != current_sl:
+                success = self.mt5.modify_sl_tp(ticket, new_sl)
+                if success:
+                    logger.info(f"[OK] Trailing SL updated: #{ticket} → {new_sl:.5f}")
+                    return True
+            
+            return False
+        
+        except Exception as e:
+            logger.error(f"Trailing stop error: {e}")
+            return False
+
+    # ==================== WEEKLY LEVELS (SMC) ====================
+
+    def get_weekly_levels(self, df: pd.DataFrame) -> Optional[Dict]:
+        """
+        Получить уровни предыдущей недели (PWL/PWH) и week open
+        Для анализа: rejection от PWH, тест PWL, синхрон с week open
+        """
+        try:
+            # Преобразуем в недельные свечи
+            df_weekly = df.copy()
+            df_weekly = df_weekly.set_index('time')
+            df_weekly = df_weekly.resample('W').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'tick_volume': 'sum'
+            }).dropna()
+
+            if len(df_weekly) < 2:
+                return None
+
+            prev_week = df_weekly.iloc[-2]
+            current_week = df_weekly.iloc[-1]
+
+            return {
+                'pwh': float(prev_week['high']),  # Previous Week High
+                'pwl': float(prev_week['low']),   # Previous Week Low
+                'pw_open': float(prev_week['open']),
+                'pw_close': float(prev_week['close']),
+                'week_open': float(current_week['open']),  # Current Week Open
+                'week_high': float(current_week['high']),
+                'week_low': float(current_week['low'])
+            }
+        except Exception as e:
+            logger.error(f"[WEEKLY LEVELS] Error: {e}")
+            return None
+
+    # ==================== RSI DIVERGENCE ====================
+
+
+    def detect_rsi_divergence(self, df: pd.DataFrame, rsi_period: int = 14) -> Optional[Dict]:
+        """
+        Детектирование RSI дивергенции — сигнал разворота.
+        Bullish : цена делает lower low,  RSI делает higher low
+        Bearish : цена делает higher high, RSI делает lower high
+
+        ✅ v3.0 (= v2.1, без изменений — уже исправлено):
+          WEAK  = diff ≤ 3.5 → return None  (статистический шум)
+          MODERATE = diff 3.5–8.0 → +20 очков
+          STRONG   = diff > 8.0   → +30 очков
+
+        Было (v2.0): WEAK diff=1.6 давал +20 — исправлено в FIX-3.
+        """
+        if len(df) < 20:
+            return None
+
+        try:
+            rsi        = self.calculate_rsi(df, rsi_period)
+            recent     = df.iloc[-15:].copy()
+            rsi_recent = rsi.iloc[-15:]
+
+            # ── Bullish Divergence ────────────────────────────────────
+            price_lows_indices = []
+            for i in range(2, len(recent) - 2):
+                if (recent.iloc[i]['low'] < recent.iloc[i-1]['low'] and
+                        recent.iloc[i]['low'] < recent.iloc[i+1]['low']):
+                    price_lows_indices.append(i)
+
+            if len(price_lows_indices) >= 2:
+                last_two_lows = price_lows_indices[-2:]
+                price_low_1   = recent.iloc[last_two_lows[0]]['low']
+                price_low_2   = recent.iloc[last_two_lows[1]]['low']
+                rsi_low_1     = rsi_recent.iloc[last_two_lows[0]]
+                rsi_low_2     = rsi_recent.iloc[last_two_lows[1]]
+
+                if price_low_2 < price_low_1 and rsi_low_2 > rsi_low_1:
+                    diff = rsi_low_2 - rsi_low_1
+                    if diff >= 3.5:
+                        strength = 'STRONG' if diff > 8.0 else 'MODERATE'
+                        return {
+                            'type':        'BULLISH_DIVERGENCE',
+                            'strength':    strength,
+                            'rsi_diff':    float(diff),
+                            'price_low_1': float(price_low_1),
+                            'price_low_2': float(price_low_2),
+                        }
+
+            # ── Bearish Divergence ────────────────────────────────────
+            price_highs_indices = []
+            for i in range(2, len(recent) - 2):
+                if (recent.iloc[i]['high'] > recent.iloc[i-1]['high'] and
+                        recent.iloc[i]['high'] > recent.iloc[i+1]['high']):
+                    price_highs_indices.append(i)
+
+            if len(price_highs_indices) >= 2:
+                last_two_highs = price_highs_indices[-2:]
+                price_high_1   = recent.iloc[last_two_highs[0]]['high']
+                price_high_2   = recent.iloc[last_two_highs[1]]['high']
+                rsi_high_1     = rsi_recent.iloc[last_two_highs[0]]
+                rsi_high_2     = rsi_recent.iloc[last_two_highs[1]]
+
+                if price_high_2 > price_high_1 and rsi_high_2 < rsi_high_1:
+                    diff = rsi_high_1 - rsi_high_2
+                    if diff >= 3.5:
+                        strength = 'STRONG' if diff > 8.0 else 'MODERATE'
+                        return {
+                            'type':         'BEARISH_DIVERGENCE',
+                            'strength':     strength,
+                            'rsi_diff':     float(diff),
+                            'price_high_1': float(price_high_1),
+                            'price_high_2': float(price_high_2),
+                        }
+
+            return None
+
+        except Exception as e:
+            logger.error(f"[RSI DIVERGENCE] Error: {e}")
+            return None
+
+
+    # ==================== DAILY REJECTION ====================
+
+    def detect_daily_rejection(self, df_daily: pd.DataFrame, key_level: float) -> Optional[Dict]:
+        """
+        Детект rejection от ключевого уровня на дневном TF
+        Rejection = длинный wick + закрытие далеко от экстремума
+        """
+        if len(df_daily) < 3:
+            return None
+
+        try:
+            current = df_daily.iloc[-1]
+
+            # Bearish Rejection (от верха)
+            upper_wick = current['high'] - max(current['close'], current['open'])
+            body_size = abs(current['close'] - current['open'])
+
+            if upper_wick > body_size * 2:  # Wick в 2 раза больше тела
+                if abs(current['high'] - key_level) / key_level < 0.01:  # В пределах 1% от уровня
+                    return {
+                        'type': 'BEARISH_REJECTION',
+                        'level': key_level,
+                        'wick_pct': float((upper_wick / current['close']) * 100),
+                        'strength': 'STRONG' if upper_wick > body_size * 3 else 'MODERATE'
+                    }
+
+            # Bullish Rejection (от низа)
+            lower_wick = min(current['close'], current['open']) - current['low']
+
+            if lower_wick > body_size * 2:
+                if abs(current['low'] - key_level) / key_level < 0.01:
+                    return {
+                        'type': 'BULLISH_REJECTION',
+                        'level': key_level,
+                        'wick_pct': float((lower_wick / current['close']) * 100),
+                        'strength': 'STRONG' if lower_wick > body_size * 3 else 'MODERATE'
+                    }
+
+            return None
+        except Exception as e:
+            logger.error(f"[DAILY REJECTION] Error: {e}")
+            return None
+
+    # ==================== 4H FRACTAL DETECTION ====================
+
+    def detect_4h_fractal(self, df_4h: pd.DataFrame, lookback: int = 20) -> Optional[Dict]:
+        """
+        Детект 4-часовых фракталов (swing high/low на 4H)
+        Используется для определения ключевых уровней - inducement
+        """
+        if len(df_4h) < lookback:
+            return None
+
+        try:
+            recent = df_4h.iloc[-lookback:]
+
+            # Find fractal highs (5-candle pattern)
+            fractal_highs = []
+            for i in range(2, len(recent) - 2):
+                if (recent.iloc[i]['high'] > recent.iloc[i-1]['high'] and
+                    recent.iloc[i]['high'] > recent.iloc[i-2]['high'] and
+                    recent.iloc[i]['high'] > recent.iloc[i+1]['high'] and
+                    recent.iloc[i]['high'] > recent.iloc[i+2]['high']):
+                    fractal_highs.append({
+                        'price': float(recent.iloc[i]['high']),
+                        'index': i
+                    })
+
+            # Find fractal lows
+            fractal_lows = []
+            for i in range(2, len(recent) - 2):
+                if (recent.iloc[i]['low'] < recent.iloc[i-1]['low'] and
+                    recent.iloc[i]['low'] < recent.iloc[i-2]['low'] and
+                    recent.iloc[i]['low'] < recent.iloc[i+1]['low'] and
+                    recent.iloc[i]['low'] < recent.iloc[i+2]['low']):
+                    fractal_lows.append({
+                        'price': float(recent.iloc[i]['low']),
+                        'index': i
+                    })
+
+            current_price = float(df_4h.iloc[-1]['close'])
+
+            # Ближайший фрактал сверху
+            nearest_fractal_high = None
+            if fractal_highs:
+                nearest_fractal_high = min(fractal_highs, key=lambda x: abs(x['price'] - current_price))
+
+            # Ближайший фрактал снизу
+            nearest_fractal_low = None
+            if fractal_lows:
+                nearest_fractal_low = min(fractal_lows, key=lambda x: abs(x['price'] - current_price))
+
+            return {
+                'fractal_high': nearest_fractal_high['price'] if nearest_fractal_high else None,
+                'fractal_low': nearest_fractal_low['price'] if nearest_fractal_low else None,
+                'current_price': current_price,
+                'high_distance_pct': ((nearest_fractal_high['price'] - current_price) / current_price * 100) if nearest_fractal_high else None,
+                'low_distance_pct': ((current_price - nearest_fractal_low['price']) / current_price * 100) if nearest_fractal_low else None,
+                'all_highs': [f['price'] for f in fractal_highs],
+                'all_lows': [f['price'] for f in fractal_lows]
+            }
+        except Exception as e:
+            logger.error(f"[4H FRACTAL] Error: {e}")
+            return None
+
+    # ==================== StB/BtS MANIPULATION ====================
+
+    def detect_stb_manipulation(self, df: pd.DataFrame) -> Optional[Dict]:
+        """
+        Детект StB (Sell to Buy) манипуляции
+        Цена сначала выбивает стопы вниз, затем резко идет вверх (и наоборот)
+        """
+        if len(df) < 10:
+            return None
+
+        try:
+            recent = df.iloc[-10:]
+            current = recent.iloc[-1]
+            prev_5 = recent.iloc[-6:-1]  # Предыдущие 5 свечей
+
+            # Bullish StB: сначала fake breakdown, потом резкий рост
+            recent_low_before = prev_5['low'].min()
+            stop_hunt_happened = current['low'] < recent_low_before * 0.998  # Пробили минимум
+            strong_reversal = current['close'] > recent_low_before * 1.005  # Закрылись выше
+
+            if stop_hunt_happened and strong_reversal:
+                wick_size = min(current['close'], current['open']) - current['low']
+                body_size = abs(current['close'] - current['open'])
+
+                # Длинный нижний wick = признак absorption
+                if wick_size > body_size * 0.5:
+                    return {
+                        'type': 'BULLISH_STB',
+                        'stop_hunt_level': float(current['low']),
+                        'reversal_close': float(current['close']),
+                        'wick_pct': float((wick_size / current['close']) * 100),
+                        'volume_ratio': float(current['tick_volume'] / prev_5['tick_volume'].mean()),
+                        'strength': 'STRONG' if wick_size > body_size else 'MODERATE'
+                    }
+
+            # Bearish StB: сначала fake breakout, потом резкий dump
+            recent_high_before = prev_5['high'].max()
+            stop_hunt_happened = current['high'] > recent_high_before * 1.002
+            strong_reversal = current['close'] < recent_high_before * 0.995
+
+            if stop_hunt_happened and strong_reversal:
+                wick_size = current['high'] - max(current['close'], current['open'])
+                body_size = abs(current['close'] - current['open'])
+
+                if wick_size > body_size * 0.5:
+                    return {
+                        'type': 'BEARISH_STB',
+                        'stop_hunt_level': float(current['high']),
+                        'reversal_close': float(current['close']),
+                        'wick_pct': float((wick_size / current['close']) * 100),
+                        'volume_ratio': float(current['tick_volume'] / prev_5['tick_volume'].mean()),
+                        'strength': 'STRONG' if wick_size > body_size else 'MODERATE'
+                    }
+
+            return None
+        except Exception as e:
+            logger.error(f"[STB MANIPULATION] Error: {e}")
+            return None
+
+    # ==================== INDUCEMENT ZONE ====================
+
+    def check_inducement_zone(self, df: pd.DataFrame, df_4h: pd.DataFrame) -> Optional[Dict]:
+        """
+        Проверка inducement (заманивание) - подготовленная ловушка
+        Это зона, куда хотят заманить трейдеров перед реальным движением
+        """
+        if len(df) < 50 or len(df_4h) < 20:
+            return None
+
+        try:
+            # Получаем 4H фракталы
+            fractal_4h = self.detect_4h_fractal(df_4h, 20)
+            if not fractal_4h:
+                return None
+
+            current_price = float(df.iloc[-1]['close'])
+
+            # Inducement выше (bearish trap)
+            if fractal_4h['fractal_high']:
+                distance_pct = ((fractal_4h['fractal_high'] - current_price) / current_price) * 100
+
+                # Если фрактал близко (0.5-2%)
+                if 0.5 < distance_pct < 2.0:
+                    # Проверяем, есть ли признаки манипуляции
+                    liquidity_pools = self.detect_liquidity_pools(df, 50)
+                    has_liquidity_above = any(lp['side'] == 'ABOVE' and lp['distance_pct'] < 2 for lp in liquidity_pools)
+
+                    if has_liquidity_above:
+                        return {
+                            'type': 'BEARISH_INDUCEMENT',
+                            'inducement_level': fractal_4h['fractal_high'],
+                            'current_price': current_price,
+                            'distance_pct': distance_pct,
+                            'scenario': 'Price may sweep liquidity above, then reverse DOWN',
+                            'action': 'Wait for rejection from inducement level'
+                        }
+
+            # Inducement ниже (bullish trap)
+            if fractal_4h['fractal_low']:
+                distance_pct = ((current_price - fractal_4h['fractal_low']) / current_price) * 100
+
+                if 0.5 < distance_pct < 2.0:
+                    liquidity_pools = self.detect_liquidity_pools(df, 50)
+                    has_liquidity_below = any(lp['side'] == 'BELOW' and lp['distance_pct'] < 2 for lp in liquidity_pools)
+
+                    if has_liquidity_below:
+                        return {
+                            'type': 'BULLISH_INDUCEMENT',
+                            'inducement_level': fractal_4h['fractal_low'],
+                            'current_price': current_price,
+                            'distance_pct': distance_pct,
+                            'scenario': 'Price may sweep liquidity below, then reverse UP',
+                            'action': 'Wait for bounce from inducement level'
+                        }
+
+            return None
+        except Exception as e:
+            logger.error(f"[INDUCEMENT ZONE] Error: {e}")
+            return None
+
+    # ==================== LIQUIDITY POOLS ====================
+
+    def detect_liquidity_pools(self, df: pd.DataFrame, lookback: int = 50) -> List[Dict]:
+        """
+        Detect liquidity pools - зоны скопления ликвидности (стопы)
+        """
+        if len(df) < lookback:
+            return []
+
+        try:
+            recent = df.iloc[-lookback:]
+            current_price = float(df.iloc[-1]['close'])
+            liquidity_zones = []
+
+            # Находим кластеры хаев
+            highs = []
+            for i in range(5, len(recent) - 5):
+                if (recent.iloc[i]['high'] > recent.iloc[i-1]['high'] and
+                    recent.iloc[i]['high'] > recent.iloc[i+1]['high']):
+                    highs.append(float(recent.iloc[i]['high']))
+
+            # Находим кластеры лоев
+            lows = []
+            for i in range(5, len(recent) - 5):
+                if (recent.iloc[i]['low'] < recent.iloc[i-1]['low'] and
+                    recent.iloc[i]['low'] < recent.iloc[i+1]['low']):
+                    lows.append(float(recent.iloc[i]['low']))
+
+            # Кластеризуем хаи (если несколько уровней близко - это ликвидность)
+            if len(highs) > 0:
+                highs_sorted = sorted(highs, reverse=True)
+                clustered_highs = []
+                for high in highs_sorted[:5]:
+                    similar_count = sum(1 for h in highs if abs(h - high) / high < 0.005)
+                    if similar_count >= 2:
+                        clustered_highs.append(high)
+
+                seen = set()
+                for high in clustered_highs:
+                    if high not in seen and high > current_price:
+                        liquidity_zones.append({
+                            'type': 'RESISTANCE_LIQUIDITY',
+                            'price': high,
+                            'distance_pct': ((high - current_price) / current_price) * 100,
+                            'side': 'ABOVE',
+                            'likely_action': 'LIQUIDITY_GRAB_THEN_REVERSAL'
+                        })
+                        seen.add(high)
+
+            # Кластеризуем лои
+            if len(lows) > 0:
+                lows_sorted = sorted(lows)
+                clustered_lows = []
+                for low in lows_sorted[:5]:
+                    similar_count = sum(1 for l in lows if abs(l - low) / low < 0.005)
+                    if similar_count >= 2:
+                        clustered_lows.append(low)
+
+                seen = set()
+                for low in clustered_lows:
+                    if low not in seen and low < current_price:
+                        liquidity_zones.append({
+                            'type': 'SUPPORT_LIQUIDITY',
+                            'price': low,
+                            'distance_pct': ((current_price - low) / current_price) * 100,
+                            'side': 'BELOW',
+                            'likely_action': 'LIQUIDITY_GRAB_THEN_REVERSAL'
+                        })
+                        seen.add(low)
+
+            # Сортируем по близости
+            liquidity_zones.sort(key=lambda x: abs(x['distance_pct']))
+            return liquidity_zones[:3]  # Топ-3 ближайших
+        except Exception as e:
+            logger.error(f"[LIQUIDITY POOLS] Error: {e}")
+            return []
+
+    # ==================== 🔥 ГЛАВНЫЙ АНАЛИЗ С BOS + MOMENTUM ====================
+
+    def analyze_signal_smc(self, symbol: str, broker_symbol: str, mt5_connector) -> Dict:
+        """🔥 ПРОФЕССИОНАЛЬНЫЙ АНАЛИЗ С SMC + BOS + MOMENTUM ФИЛЬТРАМИ"""
+        try:
+            self.mt5 = mt5_connector
+
+            # ==================== SESSION CHECK ====================
+            session_info = SessionFilter.get_current_session()
+            logger.info(f"\n[SESSION CHECK]")
+            logger.info(f"  Current session: {session_info['session']}")
+            logger.info(f"  Active: {session_info['active']}")
+            logger.info(f"  Score modifier: {session_info['score_modifier']:+d}")
+            logger.info(f"  {session_info['description']}")
+            
+            # 🚫 HARD BLOCK: неактивная сессия
+            if Config.ONLY_ACTIVE_SESSIONS and not session_info['active']:
+                logger.warning(f"  [BLOCKED] Trading disabled - {session_info['description']}")
+                return {
+                    'score': 0,
+                    'signal': 'NONE',
+                    'reason': f"Inactive session: {session_info['session']}",
+                    'symbol': symbol
+                }
+
+            # ==================== GET DATA ====================
+            df_daily = self.mt5.get_ohlcv(broker_symbol, "D1", 200)
+            df_4h = self.mt5.get_ohlcv(broker_symbol, "H4", 200)
+            df_1h = self.mt5.get_ohlcv(broker_symbol, "H1", 500)
+            df_15m = self.mt5.get_ohlcv(broker_symbol, "M15", 500)
+
+            if df_daily.empty or df_4h.empty or df_1h.empty or df_15m.empty:
+                return {
+                    'score': 0,
+                    'signal': 'NONE',
+                    'reason': 'Insufficient data',
+                    'symbol': symbol
+                }
+
+            score = 0
+            signals = []
+            warnings = []
+            current_price = float(df_15m['close'].iloc[-1])
+
+            logger.info(f"\n{'='*60}")
+            logger.info(f"[SMC ANALYSIS] {symbol} @ ${current_price:.5f}")
+            logger.info(f"{'='*60}")
+
+            # Применяем модификатор сессии
+            score += session_info['score_modifier']
+            if session_info['score_modifier'] > 0:
+                signals.append(session_info['description'])
+                logger.info(f"  [{session_info['score_modifier']:+d}] {session_info['description']}")
+            elif session_info['score_modifier'] < 0:
+                warnings.append(session_info['description'])
+                logger.warning(f"  [{session_info['score_modifier']:+d}] {session_info['description']}")
+
+            # ==================== VOLUME HARD BLOCK ====================
+            volume_ok, volume_ratio = SessionFilter.check_volume_confirmation(df_15m, Config.MIN_VOLUME_RATIO)
+            logger.info(f"\n[VOLUME CHECK]")
+            logger.info(f"  Volume ratio: {volume_ratio:.2f}x")
+            logger.info(f"  Required: {Config.MIN_VOLUME_RATIO}x")
+            
+            if not volume_ok:
+                warnings.append(f"⚠️ Low volume: {volume_ratio:.2f}x < {Config.MIN_VOLUME_RATIO}x")
+                logger.warning(f"  [BLOCKED] Volume too low - REJECTING SIGNAL")
+                return {
+                    'score': 0,
+                    'signal': 'NONE',
+                    'reason': f'Low volume: {volume_ratio:.2f}x < {Config.MIN_VOLUME_RATIO}x',
+                    'symbol': symbol,
+                    'volume_ratio': volume_ratio
+                }
+            
+            # Volume OK - продолжаем
+            score += 15
+            signals.append(f"✅ High volume ({volume_ratio:.2f}x)")
+            logger.info(f"  [+15] Volume confirmed")
+
+            # ==================== WEEKLY LEVELS ====================
+            weekly_levels = self.get_weekly_levels(df_daily)
+            if weekly_levels:
+                pwh = weekly_levels['pwh']
+                pwl = weekly_levels['pwl']
+                wop = weekly_levels['week_open']
+
+                logger.info(f"\n[WEEKLY LEVELS]")
+                logger.info(f"  PWH: ${pwh:.5f} ({((pwh - current_price)/current_price*100):.2f}% above)")
+                logger.info(f"  PWL: ${pwl:.5f} ({((current_price - pwl)/current_price*100):.2f}% below)")
+                logger.info(f"  WOP: ${wop:.5f}")
+
+                # Price near PWL (bullish setup)
+                distance_to_pwl = abs(current_price - pwl) / pwl
+                if distance_to_pwl < 0.01:
+                    score += 30
+                    signals.append("🔥 Price AT PWL - high probability bounce")
+                    logger.info(f"  [+30] Price at PWL")
+                elif distance_to_pwl < 0.02:
+                    score += 15
+                    signals.append("✅ Price near PWL")
+                    logger.info(f"  [+15] Price near PWL")
+
+                # Price near PWH (bearish setup)
+                distance_to_pwh = abs(current_price - pwh) / pwh
+                if distance_to_pwh < 0.01:
+                    score += 30
+                    signals.append("🔥 Price AT PWH - high probability rejection")
+                    logger.info(f"  [+30] Price at PWH")
+                elif distance_to_pwh < 0.02:
+                    score += 15
+                    signals.append("✅ Price near PWH")
+                    logger.info(f"  [+15] Price near PWH")
+
+                # WOP sync
+                distance_to_wop = abs(current_price - wop) / wop
+                if distance_to_wop < 0.005:
+                    score += 10
+                    signals.append("✅ WOP synchronization")
+                    logger.info(f"  [+10] Price at Week Open")
+
+            # ==================== DAILY REJECTION ====================
+            if weekly_levels:
+                daily_rejection = self.detect_daily_rejection(df_daily, pwh)
+                if not daily_rejection:
+                    daily_rejection = self.detect_daily_rejection(df_daily, pwl)
+
+                if daily_rejection:
+                    logger.info(f"\n[DAILY REJECTION]")
+                    logger.info(f"  Type: {daily_rejection['type']}")
+                    logger.info(f"  Wick: {daily_rejection['wick_pct']:.2f}%")
+                    logger.info(f"  Strength: {daily_rejection['strength']}")
+
+                    if daily_rejection['strength'] == 'STRONG':
+                        score += 25
+                        signals.append(f"🔥 STRONG {daily_rejection['type']}")
+                        logger.info(f"  [+25] Strong rejection")
+                    else:
+                        score += 15
+                        signals.append(f"✅ {daily_rejection['type']}")
+                        logger.info(f"  [+15] Moderate rejection")
+
+            # ==================== RSI DIVERGENCE ====================
+            rsi_div = self.detect_rsi_divergence(df_1h, 14)
+            if rsi_div:
+                logger.info(f"\n[RSI DIVERGENCE]")
+                logger.info(f"  Type: {rsi_div['type']}")
+                logger.info(f"  Strength: {rsi_div['strength']}")
+                logger.info(f"  RSI diff: {rsi_div['rsi_diff']:.1f}")
+
+                if rsi_div['strength'] == 'STRONG':
+                    score += 20
+                    signals.append(f"🔥 STRONG {rsi_div['type']}")
+                    logger.info(f"  [+20] Strong divergence")
+                else:
+                    score += 10
+                    signals.append(f"✅ {rsi_div['type']}")
+                    logger.info(f"  [+10] Moderate divergence")
+
+            # ==================== 4H FRACTAL INDUCEMENT ====================
+            inducement = self.check_inducement_zone(df_15m, df_4h)
+            if inducement:
+                logger.info(f"\n[INDUCEMENT ZONE]")
+                logger.info(f"  Type: {inducement['type']}")
+                logger.info(f"  Level: ${inducement['inducement_level']:.5f}")
+                logger.info(f"  Distance: {inducement['distance_pct']:.2f}%")
+                logger.info(f"  Scenario: {inducement['scenario']}")
+
+                score += 15
+                signals.append(f"✅ {inducement['type']} detected")
+                logger.info(f"  [+15] Inducement zone")
+
+            # ==================== StB MANIPULATION ====================
+            stb_manip = self.detect_stb_manipulation(df_15m)
+            if stb_manip:
+                logger.info(f"\n[StB MANIPULATION]")
+                logger.info(f"  Type: {stb_manip['type']}")
+                logger.info(f"  Strength: {stb_manip['strength']}")
+                logger.info(f"  Wick: {stb_manip['wick_pct']:.2f}%")
+                logger.info(f"  Volume ratio: {stb_manip['volume_ratio']:.2f}x")
+
+                if stb_manip['strength'] == 'STRONG':
+                    score += 20
+                    signals.append(f"🔥 STRONG {stb_manip['type']}")
+                    logger.info(f"  [+20] Strong manipulation")
+                else:
+                    score += 10
+                    signals.append(f"✅ {stb_manip['type']}")
+                    logger.info(f"  [+10] Moderate manipulation")
+
+            # ==================== LIQUIDITY POOLS ====================
+            liquidity_pools = self.detect_liquidity_pools(df_15m, 50)
+            if liquidity_pools:
+                logger.info(f"\n[LIQUIDITY POOLS]")
+                for lp in liquidity_pools[:2]:
+                    logger.info(f"  {lp['type']}: ${lp['price']:.5f} ({lp['distance_pct']:.2f}% {lp['side']})")
+
+                nearest_lp = liquidity_pools[0]
+                if nearest_lp['distance_pct'] < 0.5:
+                    score += 15
+                    signals.append(f"🔥 AT liquidity pool - expect grab + reversal")
+                    logger.info(f"  [+15] Near liquidity pool")
+
+            # ==================== TREND ALIGNMENT ====================
+            logger.info(f"\n[TREND ANALYSIS]")
+            trend_1h, distance_1h = self.detect_trend(df_1h)
+            trend_15m, distance_15m = self.detect_trend(df_15m)
+
+            logger.info(f"  H1 Trend: {trend_1h} (distance: {distance_1h*100:.2f}%)")
+            logger.info(f"  M15 Trend: {trend_15m} (distance: {distance_15m*100:.2f}%)")
+
+            if trend_1h == 'BULLISH' and trend_15m in ['BULLISH', 'NEUTRAL']:
+                score += 25
+                signals.append("✅ BULLISH trend alignment")
+                logger.info(f"  [+25] Bullish alignment")
+            elif trend_1h == 'BEARISH' and trend_15m in ['BEARISH', 'NEUTRAL']:
+                score += 25
+                signals.append("✅ BEARISH trend alignment")
+                logger.info(f"  [+25] Bearish alignment")
+            else:
+                warnings.append("⚠️ Trend conflict")
+                logger.warning(f"  [-5] Trend conflict")
+                score -= 5
+
+            # ==================== MARKET REGIME ====================
+            logger.info(f"\n[MARKET REGIME]")
+            regime_1h = self.detect_market_regime(df_1h)
+            logger.info(f"  H1 Regime: {regime_1h}")
+
+            if regime_1h == 'TRENDING':
+                score += 10
+                signals.append("✅ H1 Strong Trend (ADX > 25)")
+                logger.info(f"  [+10] Strong trend")
+            elif regime_1h == 'RANGING':
+                score += 5
+                signals.append("✅ Consolidation - breakout setup")
+                logger.info(f"  [+5] Consolidation")
+
+            # ==================== ATR FILTER ====================
+            logger.info(f"\n[VOLATILITY CHECK]")
+            atr_pct = self.calculate_atr_pct(df_15m)
+            logger.info(f"  ATR: {atr_pct*100:.3f}%")
+
+            min_atr = 0.002 if symbol in ['GOLD', 'XAUUSD', 'XAGUSD'] else Config.MIN_ATR_PCT
+            max_atr = Config.MAX_ATR_PCT
+
+            if atr_pct < min_atr:
+                warnings.append(f"⚠️ ATR too low: {atr_pct*100:.3f}%")
+                logger.warning(f"  [BLOCK] ATR too low")
+                return {
+                    'score': 0,
+                    'signal': 'NONE',
+                    'reason': 'ATR too low',
+                    'symbol': symbol
+                }
+
+            if atr_pct > max_atr:
+                warnings.append(f"⚠️ ATR too high: {atr_pct*100:.3f}% (news?)")
+                logger.warning(f"  [BLOCK] ATR too high")
+                return {
+                    'score': 0,
+                    'signal': 'NONE',
+                    'reason': 'ATR too high',
+                    'symbol': symbol
+                }
+
+            score += 10
+            logger.info(f"  [+10] ATR OK")
+
+            # ==================== RSI CHECK ====================
+            rsi = float(self.calculate_rsi(df_15m, 14).iloc[-1])
+            logger.info(f"\n[RSI]")
+            logger.info(f"  RSI: {rsi:.1f}")
+
+            if 25 < rsi < 75:
+                score += 5
+                logger.info(f"  [+5] RSI neutral")
+            else:
+                warnings.append(f"⚠️ RSI extreme: {rsi:.1f}")
+                logger.warning(f"  [-3] RSI extreme")
+                score -= 3
+
+            # ==================== CONFLICT DETECTION ====================
+            logger.info(f"\n[SIGNAL QUALITY CHECK]")
+            bullish_count = sum(1 for s in signals if 'BULL' in s.upper() or 'PWL' in s or 'bounce' in s.lower())
+            bearish_count = sum(1 for s in signals if 'BEAR' in s.upper() or 'PWH' in s or 'rejection' in s.lower())
+
+            logger.info(f"  Bullish factors: {bullish_count}")
+            logger.info(f"  Bearish factors: {bearish_count}")
+
+            # 🚫 HARD BLOCK: conflicting signals
+            if abs(bullish_count - bearish_count) <= 1:
+                warnings.append("⚠️ CONFLICTING SIGNALS - no clear direction")
+                logger.warning(f"  [BLOCKED] Signal conflict detected")
+                return {
+                    'score': score,
+                    'signal': 'NONE',
+                    'reason': 'Conflicting signals - unclear direction',
+                    'symbol': symbol,
+                    'bullish_count': bullish_count,
+                    'bearish_count': bearish_count
+                }
+
+            logger.info(f"  [OK] Clear direction: {'BULLISH' if bullish_count > bearish_count else 'BEARISH'}")
+
+            # ==================== DETERMINE SIGNAL ====================
+            logger.info(f"\n{'='*60}")
+            logger.info(f"[FINAL SCORE] {score}")
+            logger.info(f"[MIN REQUIRED] {Config.MIN_SCORE}")
+            logger.info(f"{'='*60}")
+
+            signal_type = 'NONE'
+
+            if score >= Config.MIN_SCORE:
+                # Determine direction based on clear majority
+                if bullish_count > bearish_count:
+                    if trend_1h in ['BULLISH', 'NEUTRAL']:
+                        signal_type = 'LONG'
+                    else:
+                        logger.warning(f"  [CONFLICT] Bullish signals but bearish trend")
+                        signal_type = 'WAIT'
+                elif bearish_count > bullish_count:
+                    if trend_1h in ['BEARISH', 'NEUTRAL']:
+                        signal_type = 'SHORT'
+                    else:
+                        logger.warning(f"  [CONFLICT] Bearish signals but bullish trend")
+                        signal_type = 'WAIT'
+                else:
+                    signal_type = 'WAIT'
+            else:
+                logger.warning(f"  [LOW SCORE] {score} < {Config.MIN_SCORE}")
+
+            # ==================== 🆕 BOS + MOMENTUM CONFIRMATION ====================
+            if signal_type in ['LONG', 'SHORT']:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"[🔥 ENTRY CONFIRMATION] Checking BOS + Momentum...")
+                logger.info(f"{'='*60}")
+                
+                # 🆕 ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА BOS
+                bos_confirmed, bos_msg = self.confirm_bos_entry(
+                    df_15m, 
+                    'LONG' if signal_type == 'LONG' else 'SHORT'
+                )
+                
+                if not bos_confirmed:
+                    logger.warning(f"[❌ BOS REJECT] {symbol}: {bos_msg}")
+                    return {
+                        'symbol': symbol,
+                        'signal': 'NONE',
+                        'score': score,
+                        'entry_price': current_price,
+                        'reason': f"No BOS confirmation: {bos_msg}",
+                        'reasons': signals + [f"❌ No BOS: {bos_msg}"],
+                        'warnings': warnings,
+                        'atr_pct': atr_pct,
+                        'trend_1h': trend_1h,
+                        'trend_15m': trend_15m,
+                        'rsi': rsi,
+                        'session_info': session_info,
+                        'volume_ratio': volume_ratio
+                    }
+                
+                logger.info(f"[+15] ✅ {bos_msg}")
+                signals.append(f"✅ BOS: {bos_msg}")
+                score += 15  # Бонус за подтверждение
+                
+                # 🆕 ПРОВЕРКА MOMENTUM ПРЯМО СЕЙЧАС
+                has_momentum, momentum_score = self.check_immediate_momentum(
+                    df_15m, 
+                    'LONG' if signal_type == 'LONG' else 'SHORT'
+                )
+                
+                if not has_momentum:
+                    logger.warning(f"[❌ MOMENTUM REJECT] {symbol}: No immediate momentum")
+                    return {
+                        'symbol': symbol,
+                        'signal': 'NONE',
+                        'score': score,
+                        'entry_price': current_price,
+                        'reason': "No immediate momentum",
+                        'reasons': signals + ["❌ No immediate momentum"],
+                        'warnings': warnings,
+                        'atr_pct': atr_pct,
+                        'trend_1h': trend_1h,
+                        'trend_15m': trend_15m,
+                        'rsi': rsi,
+                        'session_info': session_info,
+                        'volume_ratio': volume_ratio
+                    }
+                
+                momentum_bonus = int(momentum_score * 0.2)
+                logger.info(f"[+{momentum_bonus}] ✅ Strong Momentum: {momentum_score:.0f}/100")
+                signals.append(f"✅ Momentum: {momentum_score:.0f}/100")
+                score += momentum_bonus  # До +20 баллов
+                
+                logger.info(f"\n[✅ FINAL SCORE AFTER CONFIRMATION] {score}")
+                logger.info(f"[✅ SIGNAL CONFIRMED] {signal_type}")
+
+            logger.info(f"[SIGNAL] {signal_type}")
+
+            return {
+                'score': score,
+                'signal': signal_type,
+                'entry_price': current_price,
+                'reasons': signals,
+                'warnings': warnings,
+                'atr_pct': atr_pct,
+                'trend_1h': trend_1h,
+                'trend_15m': trend_15m,
+                'rsi': rsi,
+                'symbol': symbol,
+                'session_info': session_info,
+                'volume_ratio': volume_ratio,
+                'bullish_count': bullish_count,
+                'bearish_count': bearish_count,
+                'weekly_levels': weekly_levels,
+                'stb_manipulation': stb_manip,
+                'inducement': inducement
+            }
+
+        except Exception as e:
+            logger.error(f"[SMC ANALYSIS ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'score': 0,
+                'signal': 'NONE',
+                'reason': str(e),
+                'reasons': [],
+                'warnings': [],
+                'symbol': symbol
+            }
+
+# ==================== LEVEL RETEST STRATEGY ====================
+class LevelRetestAnalyzer:
+    """
+    Strategy: Support/Resistance Flip + Level Retest
+
+    Логика:
+    1. Ключевые горизонтальные уровни по swing highs/lows на H1
+    2. Уровень валидный = 2+ касания в пределах tolerance
+    3. Пробой уровня (2+ свечи закрылись по ту сторону)
+    4. Ретест (цена вернулась к уровню в пределах ATR)
+    5. Свеча отторжения (pin bar, engulfing, strong candle)
+    6. Вход: от уровня в направлении пробоя
+    7. SL: за уровнем + буфер ATR × 0.5
+    8. TP: следующий ключевой уровень
+    """
+
+    def __init__(self):
+        self.mt5 = None
+
+    # ──────────────────────────────────────────────────
+    # ATR HELPER
+    # ──────────────────────────────────────────────────
+
+    def calculate_atr(self, df: pd.DataFrame) -> float:
+        try:
+            tr1 = df['high'] - df['low']
+            tr2 = abs(df['high'] - df['close'].shift())
+            tr3 = abs(df['low'] - df['close'].shift())
+            tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            return float(tr.rolling(14).mean().iloc[-1])
+        except:
+            return 0.0
+
+    # ──────────────────────────────────────────────────
+    # KEY LEVELS DETECTION
+    # ──────────────────────────────────────────────────
+
+    def detect_key_levels(
+        self, df: pd.DataFrame,
+        lookback: int = 100,
+        tolerance_pct: float = 0.0015
+    ) -> List[Dict]:
+        """
+        Ключевые горизонтальные уровни по кластеризации свинг-хаев/лоев.
+        Уровень валиден при >= 2 касаниях.
+        """
+        try:
+            if len(df) < lookback:
+                return []
+
+            recent        = df.iloc[-lookback:].copy().reset_index(drop=True)
+            current_price = float(df['close'].iloc[-1])
+            raw_levels    = []
+
+            for i in range(2, len(recent) - 2):
+                # Swing High
+                if (recent.iloc[i]['high'] > recent.iloc[i-1]['high'] and
+                        recent.iloc[i]['high'] > recent.iloc[i-2]['high'] and
+                        recent.iloc[i]['high'] > recent.iloc[i+1]['high'] and
+                        recent.iloc[i]['high'] > recent.iloc[i+2]['high']):
+                    raw_levels.append({
+                        'price': float(recent.iloc[i]['high']),
+                        'kind': 'high', 'idx': i
+                    })
+
+                # Swing Low
+                if (recent.iloc[i]['low'] < recent.iloc[i-1]['low'] and
+                        recent.iloc[i]['low'] < recent.iloc[i-2]['low'] and
+                        recent.iloc[i]['low'] < recent.iloc[i+1]['low'] and
+                        recent.iloc[i]['low'] < recent.iloc[i+2]['low']):
+                    raw_levels.append({
+                        'price': float(recent.iloc[i]['low']),
+                        'kind': 'low', 'idx': i
+                    })
+
+            # ── Кластеризация близких уровней ──
+            used       = set()
+            key_levels = []
+
+            for i, lv in enumerate(raw_levels):
+                if i in used:
+                    continue
+                cluster = [lv]
+                for j, other in enumerate(raw_levels):
+                    if j != i and j not in used:
+                        if abs(lv['price'] - other['price']) / lv['price'] < tolerance_pct:
+                            cluster.append(other)
+                            used.add(j)
+                used.add(i)
+
+                if len(cluster) >= 2:
+                    avg_price = sum(c['price'] for c in cluster) / len(cluster)
+                    key_levels.append({
+                        'price':        avg_price,
+                        'touches':      len(cluster),
+                        'strength':     'STRONG' if len(cluster) >= 3 else 'MODERATE',
+                        'distance_pct': abs(avg_price - current_price) / current_price * 100,
+                    })
+
+            key_levels.sort(key=lambda x: x['distance_pct'])
+
+            logger.info(f"[KEY LEVELS] Found {len(key_levels)} levels")
+            for lv in key_levels[:5]:
+                logger.info(
+                    f"  {lv['price']:.5f} | {lv['touches']} touches | "
+                    f"{lv['strength']} | {lv['distance_pct']:.2f}% away"
+                )
+
+            return key_levels[:10]
+
+        except Exception as e:
+            logger.error(f"detect_key_levels error: {e}")
+            return []
+
+    # ──────────────────────────────────────────────────
+    # BREAKOUT DETECTION
+    # ──────────────────────────────────────────────────
+
+    def detect_level_breakout(
+        self, df: pd.DataFrame,
+        level_price: float,
+        confirmation_candles: int = 2
+    ) -> Optional[str]:
+        """
+        Возвращает:
+        - 'BROKE_ABOVE' → уровень пробит вверх (стал поддержкой)
+        - 'BROKE_BELOW' → уровень пробит вниз (стал сопротивлением)
+        - None           → пробоя не было
+        """
+        try:
+            if len(df) < 25:
+                return None
+
+            breakout_window = df.iloc[-20:-3]   # окно пробоя
+            current_price   = float(df['close'].iloc[-1])
+
+            # Пробой ВВЕРХ + возврат к уровню
+            closed_above   = (breakout_window['close'] > level_price * 1.0003).sum()
+            came_back_down = current_price <= level_price * 1.003
+
+            if closed_above >= confirmation_candles and came_back_down:
+                logger.info(
+                    f"  [BROKE_ABOVE] {level_price:.5f} | "
+                    f"{closed_above} candles above | Price returned to retest"
+                )
+                return 'BROKE_ABOVE'
+
+            # Пробой ВНИЗ + возврат к уровню
+            closed_below  = (breakout_window['close'] < level_price * 0.9997).sum()
+            came_back_up  = current_price >= level_price * 0.997
+
+            if closed_below >= confirmation_candles and came_back_up:
+                logger.info(
+                    f"  [BROKE_BELOW] {level_price:.5f} | "
+                    f"{closed_below} candles below | Price returned to retest"
+                )
+                return 'BROKE_BELOW'
+
+            return None
+
+        except Exception as e:
+            logger.error(f"detect_level_breakout error: {e}")
+            return None
+
+    # ──────────────────────────────────────────────────
+    # REJECTION CANDLE
+    # ──────────────────────────────────────────────────
+
+    def detect_rejection_candle(
+        self, df: pd.DataFrame, direction: str
+    ) -> Tuple[bool, str]:
+        """
+        Паттерны:
+        - Pin Bar    (длинный wick, маленькое тело)
+        - Engulfing  (поглощение предыдущей свечи)
+        - Strong Candle (тело > 60% range)
+        direction: 'BEARISH' или 'BULLISH'
+        """
+        try:
+            if len(df) < 3:
+                return False, "Not enough data"
+
+            c = df.iloc[-1]
+            p = df.iloc[-2]
+
+            body        = abs(c['close'] - c['open'])
+            total_range = c['high'] - c['low']
+
+            if total_range < 0.000001:
+                return False, "Zero range"
+
+            upper_wick = c['high'] - max(c['close'], c['open'])
+            lower_wick = min(c['close'], c['open']) - c['low']
+
+            if direction == 'BEARISH':
+                if upper_wick > body * 1.8 and c['close'] < c['open']:
+                    return True, f"🎯 Bearish Pin Bar (wick {upper_wick / total_range * 100:.0f}%)"
+                if c['open'] > p['close'] and c['close'] < p['open'] and c['close'] < c['open']:
+                    return True, "🎯 Bearish Engulfing"
+                if c['close'] < c['open'] and body > total_range * 0.60:
+                    return True, f"✅ Strong Bearish ({body / total_range * 100:.0f}% body)"
+
+            else:   # BULLISH
+                if lower_wick > body * 1.8 and c['close'] > c['open']:
+                    return True, f"🎯 Bullish Pin Bar (wick {lower_wick / total_range * 100:.0f}%)"
+                if c['open'] < p['close'] and c['close'] > p['open'] and c['close'] > c['open']:
+                    return True, "🎯 Bullish Engulfing"
+                if c['close'] > c['open'] and body > total_range * 0.60:
+                    return True, f"✅ Strong Bullish ({body / total_range * 100:.0f}% body)"
+
+            return False, "No rejection candle yet"
+
+        except Exception as e:
+            logger.error(f"detect_rejection_candle error: {e}")
+            return False, str(e)
+
+    # ──────────────────────────────────────────────────
+    # NEXT TARGET (TP)
+    # ──────────────────────────────────────────────────
+
+    def find_next_target(
+        self, key_levels: List[Dict],
+        current_price: float,
+        direction: str
+    ) -> Optional[float]:
+        """Найти следующий ключевой уровень как цель (TP)"""
+        try:
+            if direction == 'SHORT':
+                candidates = [lv['price'] for lv in key_levels if lv['price'] < current_price * 0.998]
+                return max(candidates) if candidates else None
+            else:
+                candidates = [lv['price'] for lv in key_levels if lv['price'] > current_price * 1.002]
+                return min(candidates) if candidates else None
+        except:
+            return None
+
+    # ──────────────────────────────────────────────────
+    # MAIN ANALYZE
+    # ──────────────────────────────────────────────────
+
+    def analyze(self, symbol: str, broker_symbol: str, mt5_connector) -> Dict:
+        """Главный метод: анализ по стратегии Level Retest"""
+        try:
+            self.mt5 = mt5_connector
+
+            session_info = SessionFilter.get_current_session()
+            if Config.ONLY_ACTIVE_SESSIONS and not session_info['active']:
+                return {
+                    'score': 0, 'signal': 'NONE', 'symbol': symbol,
+                    'strategy': 'LEVEL_RETEST',
+                    'reason': f"Inactive session: {session_info['session']}",
+                }
+
+            df_h1  = self.mt5.get_ohlcv(broker_symbol, "H1",  150)
+            df_m15 = self.mt5.get_ohlcv(broker_symbol, "M15", 100)
+
+            if df_h1.empty or df_m15.empty:
+                return {
+                    'score': 0, 'signal': 'NONE',
+                    'reason': 'No data', 'symbol': symbol,
+                }
+
+            current_price = float(df_m15['close'].iloc[-1])
+            atr_h1        = self.calculate_atr(df_h1)
+            score         = 0
+            signals       = []
+
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"[LEVEL RETEST] {symbol} @ {current_price:.5f} | ATR={atr_h1:.5f}")
+            logger.info(f"{'=' * 60}")
+
+            # ── STEP 1: Ключевые уровни ──
+            key_levels = self.detect_key_levels(df_h1, lookback=100)
+            if not key_levels:
+                return {
+                    'score': 0, 'signal': 'NONE',
+                    'reason': 'No key levels', 'symbol': symbol,
+                }
+
+            # ── STEP 2: Уровень в зоне ретеста ──
+            retest_level        = None
+            breakout_dir        = None
+            proximity_threshold = atr_h1 * 0.7
+
+            for lv in key_levels:
+                if abs(current_price - lv['price']) > proximity_threshold:
+                    continue
+                bd = self.detect_level_breakout(df_h1, lv['price'])
+                if bd:
+                    retest_level = lv
+                    breakout_dir = bd
+                    logger.info(
+                        f"[RETEST FOUND] ${lv['price']:.5f} | {bd} | "
+                        f"{lv['strength']} ({lv['touches']} touches)"
+                    )
+                    break
+
+            if not retest_level:
+                return {
+                    'score': 0, 'signal': 'NONE',
+                    'reason': f"No retest near current price (checked {len(key_levels)} levels)",
+                    'symbol': symbol, 'strategy': 'LEVEL_RETEST',
+                }
+
+            level_price = retest_level['price']
+
+            # Базовый score за ретест
+            base_score = 35 if retest_level['strength'] == 'STRONG' else 25
+            score += base_score
+            signals.append(
+                f"✅ {retest_level['strength']} level retest @ {level_price:.5f} "
+                f"({retest_level['touches']} touches)"
+            )
+            logger.info(f"[+{base_score}] Level retest confirmed")
+
+            # ── STEP 3: Направление ──
+            if breakout_dir == 'BROKE_ABOVE':
+                trade_direction = 'LONG'
+                candle_dir      = 'BULLISH'
+                signals.append("📈 S/R Flip: resistance → support → BUY retest")
+            else:
+                trade_direction = 'SHORT'
+                candle_dir      = 'BEARISH'
+                signals.append("📉 S/R Flip: support → resistance → SELL retest")
+
+            # ── STEP 4: Свеча отторжения на M15 ──
+            has_rejection, rejection_msg = self.detect_rejection_candle(df_m15, candle_dir)
+            if has_rejection:
+                score += 25
+                signals.append(rejection_msg)
+                logger.info(f"[+25] {rejection_msg}")
+            else:
+                score += 5
+                signals.append(f"⚠️ {rejection_msg} — consider waiting")
+                logger.info(f"[+5] {rejection_msg}")
+
+            # ── STEP 5: Volume (закрытая свеча!) ──
+            last_vol = float(df_m15['tick_volume'].iloc[-2])        # последняя закрытая
+            avg_vol  = float(df_m15['tick_volume'].iloc[-21:-2].mean())
+            vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
+
+            if vol_ratio >= 1.2:
+                score += 15
+                signals.append(f"✅ Volume {vol_ratio:.2f}x")
+            else:
+                signals.append(f"⚠️ Volume low {vol_ratio:.2f}x")
+            logger.info(f"[VOL] {vol_ratio:.2f}x → score +{15 if vol_ratio >= 1.2 else 0}")
+
+            # ── STEP 6: Session modifier ──
+            score += session_info['score_modifier']
+            if session_info['score_modifier'] > 0:
+                signals.append(session_info['description'])
+
+            # ── STEP 7: Proximity bonus ──
+            dist_to_level = abs(current_price - level_price)
+            if dist_to_level < atr_h1 * 0.3:
+                score += 10
+                signals.append(f"✅ Very close to level ({dist_to_level:.5f})")
+                logger.info("[+10] Price very close to level")
+
+            logger.info(f"\n[LEVEL RETEST SCORE] {score} / {Config.MIN_SCORE}")
+
+            # ── STEP 8: SL / TP ──
+            atr_buffer = atr_h1 * 0.5
+            sl         = level_price + atr_buffer if trade_direction == 'SHORT' else level_price - atr_buffer
+            tp_price   = self.find_next_target(key_levels, current_price, trade_direction)
+
+            sl_dist  = abs(current_price - sl)
+            tp_dist  = abs(current_price - tp_price) if tp_price else sl_dist * Config.MIN_RR_RATIO
+            rr_ratio = tp_dist / sl_dist if sl_dist > 0 else 0
+
+            if rr_ratio < Config.MIN_RR_RATIO:
+                logger.warning(f"[LOW RR] {rr_ratio:.1f} < {Config.MIN_RR_RATIO} - skipping")
+                return {
+                    'score': score, 'signal': 'NONE',
+                    'reason': f"RR too low: {rr_ratio:.1f}R (min {Config.MIN_RR_RATIO}R)",
+                    'symbol': symbol, 'strategy': 'LEVEL_RETEST',
+                }
+
+            score += 10
+            signals.append(f"✅ RR = {rr_ratio:.1f}R")
+
+            # ── Финальный сигнал ──
+            signal_type = trade_direction if score >= Config.MIN_SCORE else 'NONE'
+
+            return {
+                'score':          score,
+                'signal':         signal_type,
+                'entry_price':    current_price,
+                'level_price':    level_price,
+                'sl':             sl,
+                'tp':             tp_price,
+                'rr_ratio':       rr_ratio,
+                'breakout_dir':   breakout_dir,
+                'trade_direction': trade_direction,
+                'volume_ratio':   vol_ratio,
+                'reasons':        signals,
+                'warnings':       [],
+                'symbol':         symbol,
+                'session_info':   session_info,
+                'strategy':       'LEVEL_RETEST',
+                'atr':            atr_h1,
+            }
+
+        except Exception as e:
+            logger.error(f"LevelRetestAnalyzer.analyze error: {e}")
+            import traceback; traceback.print_exc()
+            return {
+                'score': 0, 'signal': 'NONE',
+                'reason': str(e), 'symbol': symbol,
+                'strategy': 'LEVEL_RETEST',
+            }
+
+
+# ==================== POSITION TRACKER ====================
+class PositionTracker:
+    """Monitor positions and manage TP/SL progression with journal logging"""
+
+    def __init__(self, mt5: MT5Connector, notifier: TelegramNotifier):
+        self.mt5 = mt5
+        self.notifier = notifier
+        self.tracked_positions = {}
+        self.trade_journal = None  # Linked by ForexTradingBot.__init__
+
+    def track_position(self, ticket: int, signal: Dict):
+        """Start tracking a new position"""
+        self.tracked_positions[ticket] = {
+            'symbol':        signal['symbol'],
+            'direction':     signal['direction'],
+            'entry':         signal['entry'],
+            'tp1':           signal.get('tp1'),
+            'tp2':           signal.get('tp2'),
+            'tp3':           signal.get('tp3'),
+            'tp4':           signal.get('tp4'),
+            'tp_final':      signal.get('tp_final'),
+            'sl':            signal.get('sl'),
+            'source':        signal.get('source', 'AUTO'),
+            'tp1_hit':       False,
+            'tp2_hit':       False,
+            'tp3_hit':       False,
+            'tp4_hit':       False,
+            'breakeven_set': False,
+            'open_time':     datetime.utcnow(),
+        }
+        logger.info(
+            f"[TRACK] Position #{ticket} | {signal['symbol']} {signal['direction']} | "
+            f"TPs: {signal.get('tp1')}/{signal.get('tp2')}/{signal.get('tp3')}"
+        )
+
+    # ================================================================
+    # MONITOR LOOP
+    # ================================================================
+
+    def monitor_positions(self):
+        """Check all tracked positions for TP hits or unexpected closures"""
+        try:
+            open_positions = self.mt5.get_positions()
+            open_tickets   = {p['ticket'] for p in open_positions}
+
+            for ticket, data in list(self.tracked_positions.items()):
+
+                # ── Position closed externally (SL hit or manual close) ──
+                if ticket not in open_tickets:
+                    self._handle_external_close(ticket, data)
+                    continue
+
+                pos           = next(p for p in open_positions if p['ticket'] == ticket)
+                current_price = pos['current_price']
+                direction     = data['direction']
+
+                if direction == 'BUY':
+                    if data['tp1'] and not data['tp1_hit'] and current_price >= data['tp1']:
+                        self._handle_tp1_hit(ticket, data, pos)
+                    if data['tp2'] and not data['tp2_hit'] and current_price >= data['tp2']:
+                        self._handle_tp2_hit(ticket, data, pos)
+                    if data['tp3'] and not data['tp3_hit'] and current_price >= data['tp3']:
+                        self._handle_tp3_hit(ticket, data, pos)
+                    if data['tp4'] and not data['tp4_hit'] and current_price >= data['tp4']:
+                        self._handle_tp4_hit(ticket, data, pos)
+
+                else:  # SELL
+                    if data['tp1'] and not data['tp1_hit'] and current_price <= data['tp1']:
+                        self._handle_tp1_hit(ticket, data, pos)
+                    if data['tp2'] and not data['tp2_hit'] and current_price <= data['tp2']:
+                        self._handle_tp2_hit(ticket, data, pos)
+                    if data['tp3'] and not data['tp3_hit'] and current_price <= data['tp3']:
+                        self._handle_tp3_hit(ticket, data, pos)
+                    if data['tp4'] and not data['tp4_hit'] and current_price <= data['tp4']:
+                        self._handle_tp4_hit(ticket, data, pos)
+
+        except Exception as e:
+            logger.error(f"Monitor positions error: {e}")
+
+    # ================================================================
+    # TP HANDLERS
+    # ================================================================
+
+    def _handle_tp1_hit(self, ticket: int, data: Dict, pos: Dict):
+        """TP1 hit → Move SL to breakeven"""
+        try:
+            logger.info(f"[TP1 HIT] #{ticket} {data['symbol']}")
+            entry = data['entry']
+
+            if Config.BREAKEVEN_AFTER_TP1:
+                self.mt5.modify_sl_tp(ticket, new_sl=entry, new_tp=pos['tp'])
+                data['breakeven_set'] = True
+
+            data['tp1_hit'] = True
+
+            # Check if TP1 is the last TP → log as closed
+            has_more_tps = any(data.get(f'tp{i}') for i in range(2, 5))
+            if not has_more_tps:
+                self._log_close_to_journal(ticket, data, pos, "TP1")
+                del self.tracked_positions[ticket]
+
+            self.notifier.send(
+                f"✅ TP1 REACHED\n\n"
+                f"Symbol: {data['symbol']}\n"
+                f"Position: #{ticket}\n"
+                f"SL → Breakeven: {entry:.5f}\n"
+                f"Profit: ${pos['profit']:.2f}",
+                urgent=False
+            )
+
+        except Exception as e:
+            logger.error(f"TP1 handler error: {e}")
+
+    def _handle_tp2_hit(self, ticket: int, data: Dict, pos: Dict):
+        """TP2 hit → Move SL to TP1"""
+        try:
+            logger.info(f"[TP2 HIT] #{ticket} {data['symbol']}")
+
+            if Config.MOVE_SL_TO_TP1_AFTER_TP2 and data.get('tp1'):
+                self.mt5.modify_sl_tp(ticket, new_sl=data['tp1'], new_tp=pos['tp'])
+
+            data['tp2_hit'] = True
+
+            # Check if TP2 is the last TP
+            has_more_tps = any(data.get(f'tp{i}') for i in range(3, 5))
+            if not has_more_tps:
+                self._log_close_to_journal(ticket, data, pos, "TP2")
+                del self.tracked_positions[ticket]
+
+            self.notifier.send(
+                f"🎯 TP2 REACHED\n\n"
+                f"Symbol: {data['symbol']}\n"
+                f"Position: #{ticket}\n"
+                f"SL → TP1: {data.get('tp1', 'N/A')}\n"
+                f"Profit: ${pos['profit']:.2f}",
+                urgent=False
+            )
+
+        except Exception as e:
+            logger.error(f"TP2 handler error: {e}")
+
+    def _handle_tp3_hit(self, ticket: int, data: Dict, pos: Dict):
+        """TP3 hit → Close or move SL to TP2"""
+        try:
+            logger.info(f"[TP3 HIT] #{ticket} {data['symbol']}")
+            data['tp3_hit'] = True
+
+            if data.get('tp4'):
+                # TP4 exists → just move SL to TP2
+                if data.get('tp2'):
+                    self.mt5.modify_sl_tp(ticket, new_sl=data['tp2'], new_tp=pos['tp'])
+                self.notifier.send(
+                    f"🎯 TP3 REACHED\n\n"
+                    f"Symbol: {data['symbol']}\n"
+                    f"Position: #{ticket}\n"
+                    f"SL → TP2: {data.get('tp2', 'N/A')}\n"
+                    f"Waiting for TP4...\n"
+                    f"Profit: ${pos['profit']:.2f}",
+                    urgent=False
+                )
+            else:
+                # No TP4 → close position
+                if Config.CLOSE_ALL_AT_TP3:
+                    profit_usd = pos['profit']
+                    self.mt5.close_trade(ticket)
+                    self._log_close_to_journal(ticket, data, pos, "TP3")
+                    del self.tracked_positions[ticket]
+
+                    self.notifier.send(
+                        f"🎉 TP3 REACHED — CLOSED\n\n"
+                        f"Symbol: {data['symbol']}\n"
+                        f"Position: #{ticket}\n"
+                        f"Final Profit: ${profit_usd:.2f}",
+                        urgent=True
+                    )
+
+        except Exception as e:
+            logger.error(f"TP3 handler error: {e}")
+
+    def _handle_tp4_hit(self, ticket: int, data: Dict, pos: Dict):
+        """TP4 hit → Close position (final target)"""
+        try:
+            logger.info(f"[TP4 HIT] #{ticket} {data['symbol']}")
+            data['tp4_hit'] = True
+
+            profit_usd = pos['profit']
+            self.mt5.close_trade(ticket)
+            self._log_close_to_journal(ticket, data, pos, "TP4")
+
+            if ticket in self.tracked_positions:
+                del self.tracked_positions[ticket]
+
+            self.notifier.send(
+                f"🏆 TP4 REACHED — CLOSED\n\n"
+                f"Symbol: {data['symbol']}\n"
+                f"Position: #{ticket}\n"
+                f"Final Profit: ${profit_usd:.2f}",
+                urgent=True
+            )
+
+        except Exception as e:
+            logger.error(f"TP4 handler error: {e}")
+
+    # ================================================================
+    # EXTERNAL CLOSE HANDLER (SL hit / manual close)
+    # ================================================================
+
+    def _handle_external_close(self, ticket: int, data: Dict):
+        """
+        Position closed outside our bot (SL triggered, manual close).
+        Determines outcome: SL or B/E based on entry vs close.
+        """
+        try:
+            logger.info(f"[EXTERNAL CLOSE] #{ticket} {data['symbol']} — detecting outcome...")
+
+            # Try to get last deal from history
+            from_time = data.get('open_time', datetime.utcnow() - timedelta(hours=48))
+
+            deals = mt5.history_deals_get(from_time, datetime.utcnow())
+            close_deal = None
+
+            if deals:
+                for deal in reversed(deals):
+                    if deal.position_id == ticket and deal.entry == mt5.DEAL_ENTRY_OUT:
+                        close_deal = deal
+                        break
+
+            entry_price = data['entry']
+
+            if close_deal:
+                close_price = close_deal.price
+                profit_usd  = close_deal.profit
+            else:
+                # Fallback: use entry, assume SL
+                close_price = data.get('sl', entry_price)
+                profit_usd  = 0.0
+
+            # Calculate result %
+            price_diff = close_price - entry_price
+            if data['direction'] == 'SELL':
+                price_diff = -price_diff
+
+            result_pct = (price_diff / entry_price) * 100
+
+            # Determine outcome
+            if abs(result_pct) < 0.05 or data.get('breakeven_set'):
+                outcome = "B/E"
+                result_pct = 0.0
+            elif result_pct < 0:
+                outcome = "SL"
+            else:
+                # Closed profitably but not by our TP handlers (edge case)
+                if data.get('tp2_hit'):
+                    outcome = "TP3"
+                elif data.get('tp1_hit'):
+                    outcome = "TP2"
+                else:
+                    outcome = "TP1"
+
+            logger.info(
+                f"[EXTERNAL CLOSE] #{ticket} {data['symbol']} → {outcome} "
+                f"({result_pct:+.2f}%) | P/L: ${profit_usd:.2f}"
+            )
+
+            # Log to journal
+            if self.trade_journal:
+                self.trade_journal.log_trade_close(
+                    ticket=ticket,
+                    symbol=data['symbol'],
+                    direction=data['direction'],
+                    outcome=outcome,
+                    result_pct=result_pct,
+                    entry=entry_price,
+                    close_price=close_price,
+                    profit_usd=profit_usd
+                )
+
+            # Notify
+            emoji = "❌" if outcome == "SL" else ("➖" if outcome == "B/E" else "✅")
+            self.notifier.send(
+                f"{emoji} POSITION CLOSED\n\n"
+                f"Symbol: {data['symbol']}\n"
+                f"Direction: {data['direction']}\n"
+                f"Outcome: {outcome}\n"
+                f"Result: {result_pct:+.2f}%\n"
+                f"P/L: ${profit_usd:.2f}\n"
+                f"Ticket: #{ticket}",
+                urgent=(outcome == "SL")
+            )
+
+            del self.tracked_positions[ticket]
+
+        except Exception as e:
+            logger.error(f"External close handler error: {e}")
+            if ticket in self.tracked_positions:
+                del self.tracked_positions[ticket]
+
+    # ================================================================
+    # JOURNAL HELPER
+    # ================================================================
+
+    def _log_close_to_journal(self, ticket: int, data: Dict, pos: Dict, outcome: str):
+        """Calculate result % and write to journal"""
+        try:
+            if not self.trade_journal:
+                return
+
+            entry_price   = data['entry']
+            close_price   = pos['current_price']
+            profit_usd    = pos['profit']
+
+            price_diff = close_price - entry_price
+            if data['direction'] == 'SELL':
+                price_diff = -price_diff
+
+            result_pct = (price_diff / entry_price) * 100
+
+            self.trade_journal.log_trade_close(
+                ticket=ticket,
+                symbol=data['symbol'],
+                direction=data['direction'],
+                outcome=outcome,
+                result_pct=result_pct,
+                entry=entry_price,
+                close_price=close_price,
+                profit_usd=profit_usd
+            )
+
+        except Exception as e:
+            logger.error(f"Journal log close error: {e}")
+
+    # ================================================================
+    # CLOSE ALL
+    # ================================================================
+
+    def close_all_positions(self, reason: str = "Manual close"):
+        """Force-close all open positions"""
+        try:
+            positions = self.mt5.get_positions()
+
+            if not positions:
+                logger.info("[CLOSE ALL] No open positions")
+                return
+
+            closed_count = 0
+
+            for pos in positions:
+                ticket    = pos['ticket']
+                symbol    = pos['symbol']
+                profit    = pos['profit']
+                entry     = pos['open_price']
+                direction = pos['type']
+
+                success = self.mt5.close_trade(ticket)
+
+                if success:
+                    closed_count += 1
+                    logger.info(f"[FORCE CLOSE] #{ticket} {symbol} — {reason} | P/L: ${profit:.2f}")
+
+                    # Determine journal outcome
+                    data = self.tracked_positions.get(ticket, {
+                        'symbol': symbol, 'direction': direction,
+                        'entry': entry, 'breakeven_set': False
+                    })
+
+                    price_diff = pos['current_price'] - entry
+                    if direction == 'SELL':
+                        price_diff = -price_diff
+                    result_pct = (price_diff / entry) * 100
+
+                    if abs(result_pct) < 0.05:
+                        outcome = "B/E"
+                        result_pct = 0.0
+                    elif result_pct < 0:
+                        outcome = "SL"
+                    else:
+                        outcome = "Manual"
+
+                    if self.trade_journal:
+                        self.trade_journal.log_trade_close(
+                            ticket=ticket,
+                            symbol=symbol,
+                            direction=direction,
+                            outcome=outcome,
+                            result_pct=result_pct,
+                            entry=entry,
+                            close_price=pos['current_price'],
+                            profit_usd=profit
+                        )
+
+                    if ticket in self.tracked_positions:
+                        del self.tracked_positions[ticket]
+
+            self.notifier.send(
+                f"⚠️ ALL POSITIONS CLOSED\n\n"
+                f"Reason: {reason}\n"
+                f"Closed: {closed_count}/{len(positions)} positions",
+                urgent=True
+            )
+
+        except Exception as e:
+            logger.error(f"Close all positions error: {e}")
+
+# ==================== TRADING SCHEDULE MANAGER ====================
+class ScheduleManager:
+    """Manage trading hours and news avoidance"""
+
+    @staticmethod
+    def can_trade_now() -> Tuple[bool, str]:
+        """Check if trading is allowed"""
+        try:
+            now = datetime.utcnow()
+            weekday = now.weekday()
+            hour = now.hour
+
+            # Saturday: closed
+            if weekday == 5:
+                return False, "Saturday - Forex market closed"
+
+            # Sunday: opens at 22:00 GMT
+            if weekday == 6:
+                if hour < 22:
+                    return False, f"Sunday before 22:00 GMT - Market opens at 22:00 (now: {hour:02d}:{now.minute:02d} GMT)"
+                else:
+                    return True, "Trading allowed (Sunday 22:00+ GMT)"
+
+            # Friday: closes at 22:00 GMT
+            if weekday == 4:
+                if hour >= Config.FRIDAY_CLOSE_HOUR_GMT:
+                    return False, f"Friday after {Config.FRIDAY_CLOSE_HOUR_GMT:02d}:00 GMT - No new trades"
+
+            # Check high-impact news
+            for day, news_hour, minute in Config.HIGH_IMPACT_NEWS_HOURS:
+                if weekday == day and hour == news_hour and abs(now.minute - minute) <= 30:
+                    return False, f"High-impact news at {news_hour}:{minute:02d} GMT"
+
+            return True, "Trading allowed"
+
+        except Exception as e:
+            logger.error(f"Schedule check error: {e}")
+            return True, "Schedule check failed - trading allowed"
+
+    @staticmethod
+    def should_close_positions_for_weekend() -> bool:
+        """Check if it's time to close positions before weekend"""
+        try:
+            now = datetime.utcnow()
+            if now.weekday() == 4 and now.hour >= Config.FRIDAY_CLOSE_HOUR_GMT:
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Weekend check error: {e}")
+            return False
+
+# ==================== TELEGRAM BOT ====================
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming text messages (manual signals)"""
+    try:
+        text     = update.message.text
+        notifier = context.bot_data['notifier']
+        bot      = context.bot_data['bot']
+
+        signal = notifier.parse_arut_signal(text)
+
+        if signal:
+            signal['message_time'] = datetime.utcnow()
+            bot.execute_manual_signal(signal)
+            await update.message.reply_text(
+                f"✅ Signal received: {signal['symbol']} {signal['direction']} @ {signal['entry']:.5f}"
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ Message received but no signal detected.\n"
+                "Use /help to see commands or send a signal in proper format."
+            )
+
+    except Exception as e:
+        logger.error(f"Handle message error: {e}")
+        await update.message.reply_text(f"❌ Error processing message: {e}")
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button callbacks"""
+    try:
+        query = update.callback_query
+        await query.answer()
+
+        bot  = context.bot_data['bot']
+        data = query.data
+
+        # ── Status ──────────────────────────────────────────────────
+        if data == "status":
+            positions = bot.mt5.get_positions()
+            if not positions:
+                await query.edit_message_text("📊 No open positions")
+                return
+
+            msg = f"📊 <b>OPEN POSITIONS ({len(positions)})</b>\n\n"
+            for pos in positions:
+                symbol  = bot._convert_from_broker_symbol(pos['symbol'])
+                p_emoji = "✅" if pos['profit'] >= 0 else "❌"
+                msg += (
+                    f"{p_emoji} <b>{symbol}</b> {pos['type']}\n"
+                    f"   Ticket: #{pos['ticket']}\n"
+                    f"   Entry: {pos['open_price']:.5f}\n"
+                    f"   Current: {pos['current_price']:.5f}\n"
+                    f"   P/L: ${pos['profit']:.2f}\n"
+                    f"   SL: {pos['sl']:.5f} | TP: {pos['tp']:.5f}\n\n"
+                )
+            await query.edit_message_text(msg, parse_mode='HTML')
+
+        # ── Close All ────────────────────────────────────────────────
+        elif data == "close_all":
+            bot.position_tracker.close_all_positions("Manual via Telegram")
+            await query.edit_message_text("✅ All positions closed")
+
+        # ── Monthly Stats ────────────────────────────────────────────
+        elif data == "stats":
+            stats = bot.trade_journal.get_monthly_summary()
+            if stats.get('total_trades', 0) == 0:
+                await query.edit_message_text("📊 No completed trades this month")
+                return
+
+            msg = (
+                f"📊 <b>MONTHLY STATS</b>\n\n"
+                f"Total Trades: {stats['total_trades']}\n"
+                f"Winners: {stats['winners']} ✅\n"
+                f"Losers: {stats['losers']} ❌\n"
+                f"Breakeven: {stats['breakeven']} ➖\n"
+                f"Win Rate: {stats['win_rate']:.1f}%\n\n"
+                f"Total P/L: {stats['total_profit_pct']:+.2f}%\n"
+                f"Best Trade: +{stats['best_trade_pct']:.2f}%\n"
+                f"Worst Trade: {stats['worst_trade_pct']:.2f}%"
+            )
+            await query.edit_message_text(msg, parse_mode='HTML')
+
+        # ── Finalize Week ────────────────────────────────────────────
+        elif data == "finalize_week":
+            bot.trade_journal.finalize_week_manually()
+            await query.edit_message_text("✅ Weekly stats finalized in journal")
+
+        # ── Pause / Resume ───────────────────────────────────────────
+        elif data == "pause":
+            bot.paused_until = datetime.utcnow() + timedelta(hours=24)
+            await query.edit_message_text("⏸️ Bot paused for 24h. Send /resume to unpause.")
+
+        elif data == "resume":
+            bot.paused_until = None
+            await query.edit_message_text("▶️ Bot resumed")
+
+        # ── Sync Journal (NEW) ───────────────────────────────────────
+        elif data == "sync_journal":
+            await query.edit_message_text("🔄 Syncing journal with MT5 history...")
+            added = bot.trade_journal.sync_from_mt5_history(days_back=60)
+            stats = bot.trade_journal.get_monthly_summary()
+            await query.edit_message_text(
+                f"✅ <b>Sync Complete</b>\n\n"
+                f"New trades added: <b>{added}</b>\n\n"
+                f"📊 This month: {stats.get('total_trades', 0)} trades | "
+                f"WR: {stats.get('win_rate', 0):.1f}% | "
+                f"P/L: {stats.get('total_profit_pct', 0):+.2f}%",
+                parse_mode='HTML'
+            )
+
+        # ── Journal Last 10 (NEW) ────────────────────────────────────
+        elif data == "journal_recent":
+            await _send_recent_trades(query=query, bot=bot, edit=True)
+
+    except Exception as e:
+        logger.error(f"Callback handler error: {e}")
+
+
+# ================================================================
+# HELPER: Recent trades table (used in /journal and callback)
+# ================================================================
+
+async def _send_recent_trades(update=None, query=None, bot=None, edit: bool = False, limit: int = 10):
+    """Build last N closed trades message from journal."""
+    try:
+        ws_name = bot.trade_journal._ensure_monthly_sheet()
+        if not ws_name:
+            text = "❌ Cannot read journal"
+        else:
+            ws = bot.trade_journal.workbook[ws_name]
+            rows = []
+            for row in range(ws.max_row, 1, -1):
+                outcome = ws.cell(row=row, column=4).value or ""
+                if outcome in ("OPEN", "") or "WEEK" in str(outcome).upper():
+                    continue
+                date    = ws.cell(row=row, column=1).value or ""
+                symbol  = ws.cell(row=row, column=2).value or ""
+                direction = ws.cell(row=row, column=3).value or ""
+                result  = ws.cell(row=row, column=5).value or ""
+                rows.append((date, symbol, direction, outcome, result))
+                if len(rows) >= limit:
+                    break
+
+            if not rows:
+                text = "📋 No closed trades this month yet"
+            else:
+                text = f"📋 <b>LAST {len(rows)} TRADES (this month)</b>\n\n"
+                text += "<code>"
+                text += f"{'Date':<12} {'Pair':<8} {'Dir':<5} {'Out':<5} {'Result':>8}\n"
+                text += "-" * 42 + "\n"
+                for date, symbol, direction, outcome, result in rows:
+                    emoji = "✅" if str(outcome).startswith("TP") else "❌" if outcome == "SL" else "➖"
+                    text += f"{str(date):<12} {symbol:<8} {direction:<5} {emoji:<5} {str(result):>8}\n"
+                text += "</code>"
+
+        if edit and query:
+            await query.edit_message_text(text, parse_mode='HTML')
+        elif update:
+            await update.message.reply_text(text, parse_mode='HTML')
+
+    except Exception as e:
+        logger.error(f"Recent trades error: {e}")
+        msg = f"❌ Error reading journal: {e}"
+        if edit and query:
+            await query.edit_message_text(msg)
+        elif update:
+            await update.message.reply_text(msg)
+
+
+# ================================================================
+# COMMANDS
+# ================================================================
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot  = context.bot_data['bot']
+    info = bot.mt5.get_balance()
+
+    # Check pause state
+    if bot.paused_until and datetime.utcnow() < bot.paused_until:
+        remaining = (bot.paused_until - datetime.utcnow()).seconds // 3600
+        pause_label = f"▶️ Resume ({remaining}h left)"
+    else:
+        pause_label = "⏸️ Pause 24h"
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Positions",     callback_data="status"),
+            InlineKeyboardButton("📈 Monthly Stats",  callback_data="stats"),
+        ],
+        [
+            InlineKeyboardButton("📋 Recent Trades",  callback_data="journal_recent"),
+            InlineKeyboardButton("🔄 Sync Journal",   callback_data="sync_journal"),
+        ],
+        [
+            InlineKeyboardButton("📅 Finalize Week",  callback_data="finalize_week"),
+            InlineKeyboardButton(pause_label,          callback_data="pause"),
+        ],
+        [
+            InlineKeyboardButton("❌ Close All",      callback_data="close_all"),
+            InlineKeyboardButton("▶️ Resume",          callback_data="resume"),
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Session info
+    session_info = SessionFilter.get_current_session()
+    session_line = session_info.get('description', 'Unknown session')
+
+    await update.message.reply_text(
+        f"🤖 <b>Forex Bot Active</b>\n\n"
+        f"💰 Balance: <b>${info:.2f}</b>\n"
+        f"📡 Pairs: {', '.join(Config.TRADING_PAIRS)}\n"
+        f"🧠 Strategies: SMC + Level Retest + Momentum\n"
+        f"🕐 Session: {session_line}\n"
+        f"⚙️ Risk/trade: {Config.RISK_PER_TRADE * 100:.1f}% | "
+        f"Max pos: {Config.MAX_POSITIONS}",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot       = context.bot_data['bot']
+    positions = bot.mt5.get_positions()
+
+    if not positions:
+        await update.message.reply_text("📊 No open positions")
+        return
+
+    msg = f"📊 <b>OPEN POSITIONS ({len(positions)})</b>\n\n"
+    for pos in positions:
+        symbol  = bot._convert_from_broker_symbol(pos['symbol'])
+        p_emoji = "✅" if pos['profit'] >= 0 else "❌"
+        msg += (
+            f"{p_emoji} <b>{symbol}</b> {pos['type']}\n"
+            f"   Ticket: #{pos['ticket']}\n"
+            f"   Entry: {pos['open_price']:.5f}\n"
+            f"   Current: {pos['current_price']:.5f}\n"
+            f"   P/L: ${pos['profit']:.2f}\n"
+            f"   SL: {pos['sl']:.5f} | TP: {pos['tp']:.5f}\n\n"
+        )
+
+    await update.message.reply_text(msg, parse_mode='HTML')
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot   = context.bot_data['bot']
+    stats = bot.trade_journal.get_monthly_summary()
+
+    if stats.get('total_trades', 0) == 0:
+        await update.message.reply_text("📊 No completed trades this month yet")
+        return
+
+    msg = (
+        f"📊 <b>MONTHLY STATISTICS</b>\n\n"
+        f"Total Trades: {stats['total_trades']}\n"
+        f"Winners: {stats['winners']} ✅\n"
+        f"Losers: {stats['losers']} ❌\n"
+        f"Breakeven: {stats['breakeven']} ➖\n"
+        f"Win Rate: {stats['win_rate']:.1f}%\n\n"
+        f"Total P/L: {stats['total_profit_pct']:+.2f}%\n"
+        f"Best Trade: +{stats['best_trade_pct']:.2f}%\n"
+        f"Worst Trade: {stats['worst_trade_pct']:.2f}%"
+    )
+
+    await update.message.reply_text(msg, parse_mode='HTML')
+
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    account = mt5.account_info()
+
+    if not account:
+        await update.message.reply_text("❌ Cannot get account info")
+        return
+
+    await update.message.reply_text(
+        f"💰 <b>ACCOUNT INFO</b>\n\n"
+        f"Balance: ${account.balance:.2f}\n"
+        f"Equity: ${account.equity:.2f}\n"
+        f"Margin: ${account.margin:.2f}\n"
+        f"Free Margin: ${account.margin_free:.2f}\n"
+        f"Margin Level: {account.margin_level:.1f}%",
+        parse_mode='HTML'
+    )
+
+
+async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot = context.bot_data['bot']
+    bot.position_tracker.close_all_positions("Manual via /closeall")
+    await update.message.reply_text("✅ All positions closed")
+
+
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot = context.bot_data['bot']
+    bot.paused_until = datetime.utcnow() + timedelta(hours=24)
+    await update.message.reply_text("⏸️ Bot paused for 24h. Use /resume to continue.")
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot = context.bot_data['bot']
+    bot.paused_until = None
+    await update.message.reply_text("▶️ Bot resumed — scanning active")
+
+
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually finalize weekly stats in journal"""
+    bot = context.bot_data['bot']
+    bot.trade_journal.finalize_week_manually()
+    await update.message.reply_text("✅ Weekly stats finalized in trade_journal.xlsx")
+
+
+async def cmd_sync_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Sync all closed trades from MT5 history into Excel journal.
+    Usage: /sync_journal        → last 30 days (default)
+           /sync_journal 60     → last 60 days
+           /sync_journal 90     → last 90 days
+    """
+    bot = context.bot_data['bot']
+
+    # Parse optional days argument
+    try:
+        args = context.args
+        days_back = int(args[0]) if args else 30
+        days_back = max(1, min(days_back, 365))  # clamp 1–365
+    except (IndexError, ValueError):
+        days_back = 30
+
+    await update.message.reply_text(
+        f"🔄 Syncing MT5 history ({days_back} days back)...\n"
+        f"Please wait..."
+    )
+
+    added = bot.trade_journal.sync_from_mt5_history(days_back=days_back)
+    stats = bot.trade_journal.get_monthly_summary()
+
+    await update.message.reply_text(
+        f"✅ <b>Sync Complete</b>\n\n"
+        f"📥 New trades added: <b>{added}</b>\n"
+        f"📅 Period: last {days_back} days\n\n"
+        f"📊 <b>This month:</b>\n"
+        f"   Trades: {stats.get('total_trades', 0)}\n"
+        f"   Win Rate: {stats.get('win_rate', 0):.1f}%\n"
+        f"   Total P/L: {stats.get('total_profit_pct', 0):+.2f}%\n"
+        f"   Best: +{stats.get('best_trade_pct', 0):.2f}% | "
+        f"Worst: {stats.get('worst_trade_pct', 0):.2f}%",
+        parse_mode='HTML'
+    )
+
+
+async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Show last N closed trades from current month.
+    Usage: /journal      → last 10 trades
+           /journal 20   → last 20 trades
+    """
+    bot = context.bot_data['bot']
+
+    try:
+        args = context.args
+        limit = int(args[0]) if args else 10
+        limit = max(1, min(limit, 50))
+    except (IndexError, ValueError):
+        limit = 10
+
+    await _send_recent_trades(update=update, bot=bot, limit=limit)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 <b>FOREX BOT COMMANDS</b>\n\n"
+        "<b>Main</b>\n"
+        "/start         — Main menu with buttons\n"
+        "/status        — Open positions\n"
+        "/balance       — Account info\n\n"
+        "<b>Journal</b>\n"
+        "/stats         — Monthly statistics\n"
+        "/journal [N]   — Last N closed trades (default: 10)\n"
+        "/sync_journal [days] — Sync from MT5 history (default: 30)\n"
+        "/week          — Finalize weekly stats\n\n"
+        "<b>Control</b>\n"
+        "/pause         — Pause new entries for 24h\n"
+        "/resume        — Resume scanning\n"
+        "/closeall      — Force close all positions\n"
+        "/help          — This message\n\n"
+        "<b>Manual signal format:</b>\n"
+        "<code>"
+        "BUY EURUSD\n"
+        "1.08500\n"
+        "TP1: 1.08700\n"
+        "TP2: 1.08900\n"
+        "SL: 1.08200"
+        "</code>",
+        parse_mode='HTML'
+    )
+
+
+# ================================================================
+# BOT RUNNER
+# ================================================================
+
+def run_telegram_bot(notifier, bot):
+    """Run Telegram bot in a separate event loop thread"""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        app = Application.builder().token(Config.TELEGRAM_TOKEN).build()
+
+        app.bot_data['notifier'] = notifier
+        app.bot_data['bot']      = bot
+
+        # ── Commands ─────────────────────────────────────────────────
+        app.add_handler(CommandHandler("start",        cmd_start))
+        app.add_handler(CommandHandler("status",       cmd_status))
+        app.add_handler(CommandHandler("balance",      cmd_balance))
+        app.add_handler(CommandHandler("stats",        cmd_stats))
+        app.add_handler(CommandHandler("journal",      cmd_journal))
+        app.add_handler(CommandHandler("sync_journal", cmd_sync_journal))
+        app.add_handler(CommandHandler("week",         cmd_week))
+        app.add_handler(CommandHandler("pause",        cmd_pause))
+        app.add_handler(CommandHandler("resume",       cmd_resume))
+        app.add_handler(CommandHandler("closeall",     cmd_close_all))
+        app.add_handler(CommandHandler("help",         cmd_help))
+
+        # ── Messages + Callbacks ──────────────────────────────────────
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        app.add_handler(CallbackQueryHandler(handle_callback))
+
+        logger.info("[OK] Telegram bot started")
+
+        loop.run_until_complete(app.initialize())
+        loop.run_until_complete(app.start())
+        loop.run_until_complete(app.updater.start_polling())
+        loop.run_forever()
+
+    except Exception as e:
+        logger.error(f"Telegram bot error: {e}")
+
+# ==================== MAIN BOT ====================
+from trade_journal import TradeJournal
+
+class ForexTradingBot:
+    """Main trading bot logic"""
+
+    def __init__(self):
+        self.mt5              = MT5Connector()
+        self.notifier         = TelegramNotifier(Config.TELEGRAM_TOKEN, Config.TELEGRAM_CHAT_ID)
+        self.risk_manager     = RiskManager(self.mt5)
+        self.analyzer         = ForexAnalyzer()
+        self.level_retest_analyzer = LevelRetestAnalyzer()
+        self.momentum_analyzer = MomentumSetupAnalyzer(self.analyzer, Config, SessionFilter)
+        self.position_tracker = PositionTracker(self.mt5, self.notifier)
+        self.schedule         = ScheduleManager()
+        self.trade_journal    = TradeJournal("trade_journal.xlsx")
+
+        # 🆕 Link journal to tracker
+        self.position_tracker.trade_journal = self.trade_journal
+
+        self.daily_pnl_start_balance = 0.0
+        self.daily_pnl_reset_date    = datetime.utcnow().date()
+        self.paused_until            = None
+
+    # ================================================================
+    # SYMBOL CONVERSION
+    # ================================================================
+
+    def _convert_to_broker_symbol(self, symbol: str) -> str:
+        if symbol == "XAUUSD":
+            return "GOLD"
+        return symbol
+
+    def _convert_from_broker_symbol(self, broker_symbol: str) -> str:
+        if broker_symbol == "GOLD":
+            return "XAUUSD"
+        return broker_symbol
+
+    # ================================================================
+    # START
+    # ================================================================
+
+    def start(self):
+        """Start bot"""
+        try:
+            if not self.mt5.connected:
+                logger.error("MT5 not connected")
+                return
+
+            initial_balance = self.mt5.get_balance()
+            self.daily_pnl_start_balance = initial_balance
+
+            self.notifier.send(
+                f"🚀 FOREX BOT STARTED\n\n"
+                f"Account: {Config.MT5_LOGIN}\n"
+                f"Server: {Config.MT5_SERVER}\n"
+                f"Balance: ${initial_balance:.2f}\n"
+                f"Risk per trade: {Config.RISK_PER_TRADE*100:.1f}%\n"
+                f"Max positions: {Config.MAX_POSITIONS}\n"
+                f"MIN_SCORE: {Config.MIN_SCORE}\n"
+                f"Strategies: SMC + Level Retest\n"
+                f"Journal: trade_journal.xlsx\n"
+                f"Pairs: {', '.join(Config.TRADING_PAIRS)}",
+                urgent=True
+            )
+
+            # Start Telegram bot
+            telegram_thread = threading.Thread(
+                target=run_telegram_bot, args=(self.notifier, self), daemon=True
+            )
+            telegram_thread.start()
+
+            # Start AFX parser
+            if Config.AFX_AUTO_PARSE:
+                logger.info("[AFX] Starting channel auto-parser...")
+                afx_thread = threading.Thread(
+                    target=run_afx_parser,
+                    args=(Config.TELETHON_API_ID, Config.TELETHON_API_HASH, Config.TELETHON_PHONE, self),
+                    daemon=True
+                )
+                afx_thread.start()
+                logger.info("[OK] AFX parser started in background")
+
+            # Main loop
+            while True:
+                try:
+                    if self._check_daily_loss_limit():
+                        logger.warning("Daily loss limit reached - paused")
+                        time.sleep(3600)
+                        continue
+
+                    if self.paused_until and datetime.utcnow() < self.paused_until:
+                        remaining = (self.paused_until - datetime.utcnow()).seconds / 3600
+                        logger.info(f"Bot paused. Remaining: {remaining:.1f}h")
+                        time.sleep(3600)
+                        continue
+
+                    can_trade, reason = self.schedule.can_trade_now()
+                    if not can_trade:
+                        logger.info(f"Trading not allowed: {reason}")
+                        if self.schedule.should_close_positions_for_weekend():
+                            self.position_tracker.close_all_positions("Weekend closure")
+                        time.sleep(3600)
+                        continue
+
+                    self.position_tracker.monitor_positions()
+                    self._scan_all_pairs()
+
+                    logger.info(f"Waiting {Config.SCAN_INTERVAL}s...")
+                    time.sleep(Config.SCAN_INTERVAL)
+
+                except KeyboardInterrupt:
+                    logger.info("Bot stopped by user")
+                    break
+                except Exception as e:
+                    logger.error(f"Main loop error: {e}")
+                    time.sleep(60)
+
+        except Exception as e:
+            logger.error(f"Bot start error: {e}")
+
+    # ================================================================
+    # DAILY LOSS LIMIT
+    # ================================================================
+
+    def _check_daily_loss_limit(self) -> bool:
+        try:
+            today = datetime.utcnow().date()
+
+            if today != self.daily_pnl_reset_date:
+                self.daily_pnl_start_balance = self.mt5.get_balance()
+                self.daily_pnl_reset_date    = today
+                logger.info(f"[DAILY RESET] New day - start balance: ${self.daily_pnl_start_balance:.2f}")
+
+            current_balance = self.mt5.get_balance()
+            daily_pnl_pct   = (current_balance - self.daily_pnl_start_balance) / self.daily_pnl_start_balance
+
+            if daily_pnl_pct <= -Config.DAILY_LOSS_LIMIT:
+                logger.warning(f"Daily loss limit hit: {daily_pnl_pct*100:.1f}%")
+
+                if Config.CLOSE_POSITIONS_ON_LOSS_LIMIT:
+                    self.position_tracker.close_all_positions("Daily loss limit")
+                else:
+                    logger.info("⚠️ Keeping positions open - only pausing NEW entries")
+
+                self.paused_until = datetime.utcnow() + timedelta(hours=24)
+
+                self.notifier.send(
+                    f"⚠️ DAILY LOSS LIMIT\n\n"
+                    f"Loss: {daily_pnl_pct*100:.1f}%\n"
+                    f"Positions: KEPT OPEN\n"
+                    f"New trades paused for 24h\n\n"
+                    f"Existing positions can recover!",
+                    urgent=True
+                )
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Daily loss check error: {e}")
+            return False
+
+        # ================================================================
+    # SCAN
+    # ================================================================
+
+    def _scan_all_pairs(self):
+        """
+        Scan: SMC + Level Retest + Momentum (3 стратегии параллельно).
+
+        ✅ v3.0:
+          [NEW-1] Cooldown per symbol — символ не сканируется повторно
+                  раньше Config.COOLDOWN_HOURS после последней сделки.
+                  self.symbol_last_trade: Dict[str, datetime] добавлен в __init__
+
+          [NEW-2] Session pre-check — если ONLY_ACTIVE_SESSIONS=True,
+                  быстро проверяем сессию ДО запуска 3 тяжёлых анализаторов.
+                  Экономит CPU и время цикла.
+
+          [NEW-3] ATR pre-filter — быстрая проверка ATR перед анализом.
+                  ATR вне диапазона [MIN_ATR_PCT, MAX_ATR_PCT] → skip.
+                  Не тратим ресурсы на analyse() для вялых/взрывных пар.
+
+          [NEW-4] Расширенный лог блокировок — показываем ВСЕ reasons
+                  из HARD BLOCK, а не первые 3 reasons сигнала.
+        """
+        try:
+            logger.info("=" * 60)
+            logger.info("[SCAN] SMC + Level Retest + Momentum...")
+            logger.info("=" * 60)
+
+            # ✅ [NEW-1] инициализируем cooldown dict если нет
+            if not hasattr(self, 'symbol_last_trade'):
+                self.symbol_last_trade: dict = {}
+
+            signals_found = 0
+
+            for symbol in Config.TRADING_PAIRS:
+                try:
+                    broker_symbol = self._convert_to_broker_symbol(symbol)
+                    logger.info("-" * 60)
+                    logger.info(f"[SCANNING] {symbol} (broker: {broker_symbol})...")
+
+                    # ── Позиция уже открыта? ──────────────────────────────
+                    positions    = self.mt5.get_positions()
+                    has_position = any(p['symbol'] == broker_symbol for p in positions)
+
+                    if has_position:
+                        logger.info(f"  [SKIP] Already have position in {symbol}")
+                        continue
+
+                    if len(positions) >= Config.MAX_POSITIONS:
+                        logger.info(f"  [SKIP] Max positions reached ({Config.MAX_POSITIONS})")
+                        continue
+
+                    # ✅ [NEW-1] Cooldown check ────────────────────────────
+                    last_trade_time = self.symbol_last_trade.get(symbol)
+                    if last_trade_time:
+                        elapsed_h = (datetime.utcnow() - last_trade_time).total_seconds() / 3600
+                        if elapsed_h < Config.COOLDOWN_HOURS:
+                            remaining = Config.COOLDOWN_HOURS - elapsed_h
+                            logger.info(
+                                f"  [COOLDOWN] {symbol}: {elapsed_h:.1f}h since last trade "
+                                f"(need {Config.COOLDOWN_HOURS}h, {remaining:.1f}h left)"
+                            )
+                            continue
+
+                    # ✅ [NEW-2] Session pre-check ─────────────────────────
+                    if Config.ONLY_ACTIVE_SESSIONS:
+                        session = SessionFilter.get_current_session()
+                        if not session['active']:
+                            logger.info(
+                                f"  [SKIP SESSION] {symbol}: "
+                                f"session={session.get('session','UNKNOWN')} inactive"
+                            )
+                            continue
+
+                    # ✅ [NEW-3] ATR pre-filter ────────────────────────────
+                    try:
+                        df_quick = self.mt5.get_ohlcv(broker_symbol, "H1", 50)
+                        if not df_quick.empty:
+                            atr_pct = self.analyzer.calculate_atr_pct(df_quick)
+                            if atr_pct < Config.MIN_ATR_PCT:
+                                logger.info(
+                                    f"  [SKIP ATR] {symbol}: ATR {atr_pct:.5f} < "
+                                    f"MIN {Config.MIN_ATR_PCT} (too quiet)"
+                                )
+                                continue
+                            if atr_pct > Config.MAX_ATR_PCT:
+                                logger.info(
+                                    f"  [SKIP ATR] {symbol}: ATR {atr_pct:.5f} > "
+                                    f"MAX {Config.MAX_ATR_PCT} (too volatile)"
+                                )
+                                continue
+                    except Exception as atr_err:
+                        logger.warning(f"  [ATR PRE-FILTER] {symbol}: {atr_err} — skipping pre-filter")
+
+                    # ── 3 анализа ─────────────────────────────────────────
+                    smc_analysis      = self.analyzer.analyze_signal_smc(symbol, broker_symbol, self.mt5)
+                    retest_analysis   = self.level_retest_analyzer.analyze(symbol, broker_symbol, self.mt5)
+                    momentum_analysis = self.momentum_analyzer.analyze(symbol, broker_symbol, self.mt5)
+
+                    logger.info(f"  [SMC]      Score={smc_analysis['score']} | {smc_analysis['signal']}")
+                    logger.info(f"  [RETEST]   Score={retest_analysis['score']} | {retest_analysis['signal']}")
+                    logger.info(f"  [MOMENTUM] Score={momentum_analysis['score']} | {momentum_analysis['signal']}")
+
+                    # ✅ [NEW-4] Расширенный лог: HARD BLOCK reasons ───────
+                    mom_reasons = momentum_analysis.get('reasons') or []
+                    block_lines = [r for r in mom_reasons if '[HARD BLOCK]' in r]
+                    if block_lines:
+                        for bl in block_lines:
+                            logger.warning(f"    ⛔ {bl}")
+                    else:
+                        for r in mom_reasons[:3]:
+                            logger.info(f"    {r}")
+
+                    # ── Выбор лучшего сигнала ─────────────────────────────
+                    chosen = self._resolve_signals(
+                        smc_analysis, retest_analysis, momentum_analysis, symbol
+                    )
+
+                    if chosen is None:
+                        logger.info(f"  [NO SIGNAL] {symbol}")
+                        continue
+
+                    logger.info(
+                        f"🔥 [SIGNAL CHOSEN] {symbol} {chosen['signal']} | "
+                        f"Score: {chosen['score']} | Strategy: {chosen.get('strategy', 'SMC')}"
+                    )
+                    signals_found += 1
+
+                    # ✅ [NEW-1] Записываем время сделки для cooldown ──────
+                    self.symbol_last_trade[symbol] = datetime.utcnow()
+
+                    strategy = chosen.get('strategy', 'SMC')
+                    if strategy == 'LEVEL_RETEST':
+                        self._execute_level_retest_signal(chosen, broker_symbol)
+                    elif strategy == 'MOMENTUM':
+                        self._execute_momentum_signal(chosen, broker_symbol)
+                    else:
+                        self._execute_auto_signal(chosen, broker_symbol)
+
+                except Exception as e:
+                    logger.error(f"  [ERROR] {symbol}: {e}")
+
+            logger.info("=" * 60)
+            logger.info(f"[SCAN COMPLETE] {len(Config.TRADING_PAIRS)} pairs | Signals: {signals_found}")
+            logger.info("=" * 60)
+
+        except Exception as e:
+            logger.error(f"Scan all pairs error: {e}")
+
+
+    def _resolve_signals(
+        self,
+        smc: Dict,
+        retest: Dict,
+        momentum: Dict,
+        symbol: str
+    ) -> Optional[Dict]:
+        """
+        Выбор лучшего сигнала из 3 стратегий: SMC, Level Retest, Momentum.
+
+        ✅ v3.0:
+          - Если Momentum сигнал заблокирован ([HARD BLOCK]),
+            явно логируем причину и отправляем Telegram.
+          - MIN_SCORE для Momentum теперь берётся из MIN_SCORE_MOMENTUM,
+            а не из общего MIN_SCORE — у них разные пороги.
+
+        Логика:
+          Нет сигналов            → None
+          LONG vs SHORT конфликт  → None (безопасность)
+          Все в одну сторону      → max score >= MIN_SCORE
+        """
+
+        def to_dir(a: Dict) -> Optional[str]:
+            return a['signal'] if a.get('signal') in ('LONG', 'SHORT') else None
+
+        smc_dir = to_dir(smc)
+        ret_dir = to_dir(retest)
+        mom_dir = to_dir(momentum)
+
+        # ✅ v3.0: проверяем hard block в momentum ещё до resolve
+        mom_reasons = momentum.get('reasons', [])
+        hard_blocked = any('[HARD BLOCK]' in r for r in mom_reasons)
+        if hard_blocked:
+            block_reason = next((r for r in mom_reasons if '[HARD BLOCK]' in r), 'Unknown')
+            logger.warning(f"  [MOMENTUM BLOCKED] {symbol}: {block_reason}")
+            self.notifier.send(
+                f"🚫 MOMENTUM BLOCKED\n\n"
+                f"Symbol: {symbol}\n"
+                f"Reason: {block_reason}",
+                urgent=False
+            )
+
+        # Собираем только активные сигналы
+        active: Dict[str, tuple] = {}
+        if smc_dir:
+            active['SMC']      = (smc_dir,  smc)
+        if ret_dir:
+            active['RETEST']   = (ret_dir,  retest)
+        if mom_dir:
+            active['MOMENTUM'] = (mom_dir,  momentum)
+
+        if not active:
+            return None
+
+        directions = {v[0] for v in active.values()}
+
+        # ── КОНФЛИКТ: одновременно LONG и SHORT ──
+        if len(directions) > 1:
+            conflict_info = " | ".join(
+                f"{k}={v[0]} (score {v[1]['score']})"
+                for k, v in active.items()
+            )
+            logger.warning(f"  [CONFLICT] {symbol}: {conflict_info} — skipping")
+            self.notifier.send(
+                f"⚠️ SIGNAL CONFLICT\n\n"
+                f"Symbol: {symbol}\n" +
+                "\n".join(
+                    f"{k}: {v[0]} (score {v[1]['score']})"
+                    for k, v in active.items()
+                ) +
+                "\n→ Skipped (conflicting directions)",
+                urgent=False
+            )
+            return None
+
+        # ── ✅ v3.0: раздельный MIN_SCORE по стратегиям ──────────────
+        def get_min_score(strategy_name: str) -> int:
+            if strategy_name == 'MOMENTUM':
+                return getattr(Config, 'MIN_SCORE_MOMENTUM', 90)
+            return Config.MIN_SCORE
+
+        qualified = [
+            v[1] for k, v in active.items()
+            if v[1]['score'] >= get_min_score(k)
+        ]
+
+        if not qualified:
+            best_name, best = max(active.items(), key=lambda x: x[1][1]['score'])
+            min_s           = get_min_score(best_name)
+            logger.info(
+                f"  [LOW SCORE] {symbol}: all below threshold. "
+                f"Best: {best_name} score {best[1]['score']} (need {min_s})"
+            )
+            return None
+
+        # Выбираем с максимальным score
+        chosen     = max(qualified, key=lambda x: x['score'])
+        strat_name = chosen.get('strategy', 'SMC')
+        direction  = list(directions)[0]
+
+        for name, (d, a) in active.items():
+            marker = "✅ chosen" if a is chosen else "  skipped"
+            logger.info(f"  [{name}] {d} score={a['score']} → {marker}")
+
+        if len(active) > 1:
+            agreeing = [
+                k for k, v in active.items()
+                if v[1]['score'] >= get_min_score(k)
+            ]
+            if len(agreeing) > 1:
+                logger.info(
+                    f"  [CONFLUENCE] {symbol}: {len(agreeing)} strategies agree "
+                    f"({', '.join(agreeing)}) → {direction}"
+                )
+
+        logger.info(
+            f"  [RESOLVED] {symbol}: {strat_name} {direction} score={chosen['score']}"
+        )
+        return chosen
+
+
+    # ================================================================
+    # EXECUTE
+    # ================================================================
+
+    def _execute_auto_signal(self, analysis: Dict, broker_symbol: str):
+        """Execute SMC auto-generated signal"""
+        try:
+            symbol      = analysis['symbol']
+            direction   = 'BUY' if analysis['signal'] == 'LONG' else 'SELL'
+            entry_price = analysis['entry_price']
+
+            logger.info(f"[EXECUTE SMC] {symbol} ({broker_symbol}) {direction} @ {entry_price:.5f}")
+
+            df_15m = self.mt5.get_ohlcv(broker_symbol, Config.MAIN_TIMEFRAME, 100)
+            sl     = self.risk_manager.calculate_dynamic_sl(df_15m, direction, entry_price)
+
+            if not self.risk_manager.validate_sl_distance(entry_price, sl, symbol):
+                logger.error(f"[REJECT] Invalid SL distance for {symbol}")
+                return
+
+            balance = self.mt5.get_balance()
+            lot     = self.risk_manager.calculate_lot_size(
+                broker_symbol, entry_price, sl, balance, Config.RISK_PER_TRADE
+            )
+
+            if lot == 0:
+                logger.error(f"[REJECT] Cannot calculate lot for {symbol}")
+                self.notifier.send(
+                    f"⚠️ SIGNAL SKIPPED\n\nSymbol: {symbol}\n"
+                    f"Reason: Not enough FREE MARGIN",
+                    urgent=False
+                )
+                return
+
+            sl_distance = abs(entry_price - sl)
+            tp          = (
+                entry_price + sl_distance * Config.MIN_RR_RATIO
+                if direction == 'BUY'
+                else entry_price - sl_distance * Config.MIN_RR_RATIO
+            )
+
+            ticket = self.mt5.open_trade(
+                symbol=broker_symbol, direction=direction,
+                lot=lot, sl=sl, tp=tp,
+                comment=f"SMC_{analysis['score']}"
+            )
+
+            if ticket:
+                self.position_tracker.track_position(ticket, {
+                    'symbol': broker_symbol, 'direction': direction,
+                    'entry': entry_price, 'tp1': tp, 'tp2': None,
+                    'tp3': None, 'tp4': None, 'sl': sl, 'source': 'SMC'
+                })
+
+                # 🆕 Journal: log open
+                self.trade_journal.log_trade_open(
+                    ticket=ticket, symbol=symbol,
+                    direction=direction, entry=entry_price
+                )
+
+                self.notifier.send(
+                    f"✅ SMC TRADE OPENED\n\n"
+                    f"Symbol: {symbol}\n"
+                    f"Direction: {direction}\n"
+                    f"Entry: {entry_price:.5f}\n"
+                    f"SL: {sl:.5f}\n"
+                    f"TP: {tp:.5f}\n"
+                    f"Lot: {lot:.2f}\n"
+                    f"Score: {analysis['score']}\n"
+                    f"Session: {analysis.get('session_info', {}).get('session', 'N/A')}\n"
+                    f"Ticket: #{ticket}",
+                    urgent=True
+                )
+                logger.info(f"[OK] SMC trade: #{ticket} {symbol} {direction}")
+            else:
+                logger.error(f"[FAILED] Could not open SMC trade for {symbol}")
+
+        except Exception as e:
+            logger.error(f"Execute auto signal error: {e}")
+
+    def _execute_momentum_signal(self, analysis: Dict, broker_symbol: str):
+        """
+        Execute Momentum strategy signal.
+
+        ✅ v3.0:
+          - При получении сигнала 'NONE' с причиной '[HARD BLOCK]'
+            отправляет отдельное Telegram-уведомление с причиной блокировки.
+          - Логирует причину блокировки в файл.
+          - Добавляет в Telegram-нотификацию открытой сделки
+            предупреждение если sweep не подтверждён.
+        """
+        try:
+            symbol      = analysis['symbol']
+            direction   = 'BUY' if analysis['signal'] == 'LONG' else 'SELL'
+            entry_price = analysis['entry_price']
+            sl          = analysis['sl']
+            tp          = analysis.get('tp')
+            rr_ratio    = analysis.get('rr_ratio', 0)
+            score       = analysis['score']
+            swing_type  = analysis.get('swing_type', '?')
+            swing_price = analysis.get('swing_price', 0)
+            session     = analysis.get('session_info', {}).get('session', 'N/A')
+            reasons     = analysis.get('reasons', [])
+
+            logger.info(
+                f"[EXECUTE MOMENTUM] {symbol} {broker_symbol} {direction} "
+                f"Entry={entry_price:.5f} | SL={sl:.5f} | TP={tp:.5f} | RR={rr_ratio:.1f}R"
+            )
+
+            if not self.risk_manager.validate_sl_distance(entry_price, sl, symbol):
+                logger.error(f"[REJECT] Invalid SL distance for {symbol}")
+                return
+
+            balance = self.mt5.get_balance()
+            lot     = self.risk_manager.calculate_lot_size(
+                broker_symbol, entry_price, sl, balance, Config.RISK_PER_TRADE
+            )
+
+            if lot <= 0:
+                logger.error(f"[REJECT] Cannot calculate lot for {symbol}")
+                self.notifier.send(
+                    f"⚠️ MOMENTUM SIGNAL SKIPPED"
+                    f"Symbol: {symbol}"
+                    f"Reason: Not enough FREE MARGIN",
+                    urgent=False
+                )
+                return
+
+            # Fallback TP если не передан
+            if not tp:
+                sl_dist = abs(entry_price - sl)
+                tp = (
+                    entry_price + sl_dist * Config.MIN_RR_RATIO
+                    if direction == 'BUY'
+                    else entry_price - sl_dist * Config.MIN_RR_RATIO
+                )
+
+            ticket = self.mt5.open_trade(
+                symbol    = broker_symbol,
+                direction = direction,
+                lot       = lot,
+                sl        = sl,
+                tp        = tp,
+                comment   = f"MOMENTUM_{score}"
+            )
+
+            if ticket:
+                sl_pips    = abs(entry_price - sl)
+                tp_pips    = abs(entry_price - tp)
+                emoji      = "🟢" if direction == 'BUY' else "🔴"
+                dir_word   = "LONG  📈" if direction == 'BUY' else "SHORT 📉"
+                top_reasons = "\n".join(f"  {r}" for r in reasons[:5])
+
+                # ✅ v3.0: предупреждение если sweep не подтверждён
+                sweep_warning = ""
+                no_sweep = any("No sweep" in r for r in reasons)
+                if no_sweep:
+                    sweep_warning = f"\n⚠️ Liquidity sweep NOT confirmed — stop hunt risk"
+
+                # ✅ v3.0: предупреждение если SL был сдвинут из-за кластера
+                sl_shifted = any("SL CLUSTER SHIFT" in r for r in reasons)
+                sl_note = "  🛡️ SL shifted (cluster protection)" if sl_shifted else ""
+
+                self.notifier.send(
+                    f"🚨 {emoji} MOMENTUM TRADE OPENED\n"
+                    f"{'─' * 30}\n"
+                    f"📌 Symbol:    {symbol}\n"
+                    f"📊 Direction: {dir_word}\n"
+                    f"💰 Lot:       {lot:.2f}\n"
+                    f"{'─' * 30}\n"
+                    f"🎯 Entry:  {entry_price:.5f}\n"
+                    f"🛑 SL:     {sl:.5f}  (dist: {sl_pips:.5f}){sl_note}\n"
+                    f"✅ TP:     {tp:.5f}  (dist: {tp_pips:.5f})\n"
+                    f"📐 RR:     {rr_ratio:.1f}R\n"
+                    f"{'─' * 30}\n"
+                    f"🔍 WHY:\n{top_reasons}"
+                    f"{sweep_warning}\n"
+                    f"{'─' * 30}\n"
+                    f"📍 Swing {swing_type} @ {swing_price:.5f}\n"
+                    f"⭐ Score:   {score}\n"
+                    f"🕐 Session: {session}\n"
+                    f"🎫 Ticket:  #{ticket}",
+                    urgent=True
+                )
+
+                # ── track_position ──
+                try:
+                    self.position_tracker.track_position(
+                        ticket,
+                        {
+                            'symbol':    broker_symbol,
+                            'direction': direction,
+                            'entry':     entry_price,
+                            'tp1':       tp,
+                            'tp2':       None,
+                            'tp3':       None,
+                            'tp4':       None,
+                            'tp_final':  None,
+                            'sl':        sl,
+                            'source':    'MOMENTUM',
+                        }
+                    )
+                except Exception as track_err:
+                    logger.error(f"[TRACK] track_position error: {track_err}")
+
+                # ── Journal ──
+                try:
+                    self.trade_journal.log_trade_open(
+                        ticket    = ticket,
+                        symbol    = symbol,
+                        direction = direction,
+                        entry     = entry_price
+                    )
+                except Exception as journal_err:
+                    logger.error(f"[JOURNAL] log error: {journal_err}")
+
+                logger.info(f"[OK] MOMENTUM trade #{ticket} | {symbol} {direction}")
+
+            else:
+                logger.error(f"[FAILED] Could not open MOMENTUM trade for {symbol}")
+                self.notifier.send(
+                    f"❌ MOMENTUM TRADE FAILED\n\n"
+                    f"Symbol: {symbol}\n"
+                    f"Direction: {direction}\n"
+                    f"Entry: {entry_price:.5f}\n"
+                    f"Reason: MT5 rejected order",
+                    urgent=False
+                )
+
+        except Exception as e:
+            logger.error(f"[EXECUTE MOMENTUM] Error: {e}")
+
+
+
+    def _execute_level_retest_signal(self, analysis: Dict, broker_symbol: str):
+        """Execute Level Retest signal"""
+        try:
+            symbol      = analysis['symbol']
+            direction   = 'BUY' if analysis['signal'] == 'LONG' else 'SELL'
+            entry_price = analysis['entry_price']
+            level_price = analysis['level_price']
+            sl          = analysis['sl']
+            tp          = analysis.get('tp')
+            rr_ratio    = analysis.get('rr_ratio', 0)
+
+            logger.info(
+                f"[EXECUTE RETEST] {symbol} ({broker_symbol}) {direction} @ {entry_price:.5f} | "
+                f"Level: {level_price:.5f} | RR: {rr_ratio:.1f}R"
+            )
+
+            if not self.risk_manager.validate_sl_distance(entry_price, sl, symbol):
+                logger.error(f"[REJECT] Invalid SL distance for {symbol}")
+                return
+
+            balance = self.mt5.get_balance()
+            lot     = self.risk_manager.calculate_lot_size(
+                broker_symbol, entry_price, sl, balance, Config.RISK_PER_TRADE
+            )
+
+            if lot == 0:
+                logger.error(f"[REJECT] Cannot calculate lot for {symbol}")
+                self.notifier.send(
+                    f"⚠️ RETEST SIGNAL SKIPPED\n\nSymbol: {symbol}\n"
+                    f"Reason: Not enough FREE MARGIN",
+                    urgent=False
+                )
+                return
+
+            if not tp:
+                sl_dist = abs(entry_price - sl)
+                tp = (
+                    entry_price + sl_dist * Config.MIN_RR_RATIO
+                    if direction == 'BUY'
+                    else entry_price - sl_dist * Config.MIN_RR_RATIO
+                )
+
+            ticket = self.mt5.open_trade(
+                symbol=broker_symbol, direction=direction,
+                lot=lot, sl=sl, tp=tp,
+                comment=f"RETEST_{analysis['score']}"
+            )
+
+            if ticket:
+                self.position_tracker.track_position(ticket, {
+                    'symbol': broker_symbol, 'direction': direction,
+                    'entry': entry_price, 'tp1': tp, 'tp2': None,
+                    'tp3': None, 'tp4': None, 'sl': sl, 'source': 'RETEST'
+                })
+
+                # 🆕 Journal: log open
+                self.trade_journal.log_trade_open(
+                    ticket=ticket, symbol=symbol,
+                    direction=direction, entry=entry_price
+                )
+
+                self.notifier.send(
+                    f"✅ RETEST TRADE OPENED\n\n"
+                    f"Symbol: {symbol}\n"
+                    f"Direction: {direction}\n"
+                    f"Entry: {entry_price:.5f}\n"
+                    f"Level: {level_price:.5f}\n"
+                    f"Breakout: {analysis.get('breakout_dir', 'N/A')}\n"
+                    f"SL: {sl:.5f}\n"
+                    f"TP: {tp:.5f}\n"
+                    f"RR: {rr_ratio:.1f}R\n"
+                    f"Lot: {lot:.2f}\n"
+                    f"Score: {analysis['score']}\n"
+                    f"Ticket: #{ticket}",
+                    urgent=True
+                )
+                logger.info(f"[OK] Retest trade: #{ticket} {symbol} {direction}")
+            else:
+                logger.error(f"[FAILED] Could not open retest trade for {symbol}")
+
+        except Exception as e:
+            logger.error(f"Execute level retest signal error: {e}")
+
+    def execute_manual_signal(self, signal: Dict):
+        """
+        Execute manual signal from Telegram/AFX.
+        - LIMIT order if price not yet at entry
+        - TP = max available TP
+        - Saves all TP levels for SL trailing
+        """
+        try:
+            symbol        = signal['symbol']
+            broker_symbol = self._convert_to_broker_symbol(symbol)
+            direction     = signal['direction']
+            entry         = signal['entry']
+            sl            = signal['sl']
+
+            logger.info(f"[EXECUTE MANUAL] {symbol} ({broker_symbol}) {direction} @ {entry:.5f}")
+
+            # ── 1. Age check (max 2 hours) ──
+            message_time = signal.get('message_time')
+            if message_time:
+                age_seconds = (datetime.utcnow() - message_time).total_seconds()
+                age_minutes = age_seconds / 60
+                if age_seconds > 7200:
+                    logger.warning(f"[SKIP] Signal too old: {age_minutes:.0f} min")
+                    self.notifier.send(
+                        f"⏰ SIGNAL SKIPPED (TOO OLD)\n\n"
+                        f"Symbol: {symbol}\nDirection: {direction}\n"
+                        f"Age: {age_minutes:.0f} min (max 120)\n"
+                        f"Entry: {entry:.5f}",
+                        urgent=False
+                    )
+                    return
+                logger.info(f"  Signal age: {age_minutes:.1f} min — OK")
+
+            # ── 2. Validate SL ──
+            if not self.risk_manager.validate_sl_distance(entry, sl, symbol):
+                logger.error(f"[REJECT] Invalid SL distance for {symbol}")
+                self.notifier.send(
+                    f"❌ SIGNAL REJECTED\n\nSymbol: {symbol}\nReason: Invalid SL distance",
+                    urgent=False
+                )
+                return
+
+            # ── 3. Calculate lot ──
+            balance = self.mt5.get_balance()
+            lot     = self.risk_manager.calculate_lot_size(
+                broker_symbol, entry, sl, balance, Config.RISK_PER_TRADE
+            )
+
+            if lot == 0:
+                logger.error(f"[REJECT] Cannot calculate lot for {symbol}")
+                self.notifier.send(
+                    f"❌ SIGNAL REJECTED\n\nSymbol: {symbol}\nReason: Cannot calculate lot size",
+                    urgent=False
+                )
+                return
+
+            # ── 4. Select max TP ──
+            all_tps = [
+                t for t in [
+                    signal.get('tp1'), signal.get('tp2'),
+                    signal.get('tp3'), signal.get('tp4')
+                ] if t is not None
+            ]
+
+            if all_tps:
+                tp_final = max(all_tps) if direction == 'BUY' else min(all_tps)
+            else:
+                sl_distance = abs(entry - sl)
+                tp_final = (
+                    entry + sl_distance * Config.MIN_RR_RATIO
+                    if direction == 'BUY'
+                    else entry - sl_distance * Config.MIN_RR_RATIO
+                )
+
+            logger.info(f"  TPs: {all_tps} | Max TP: {tp_final:.5f}")
+
+            # ── 5. Price deviation check ──
+            tick          = self.mt5.get_tick(broker_symbol)
+            current_price = tick['ask'] if direction == 'BUY' else tick['bid']
+
+            df_15m = self.mt5.get_ohlcv(broker_symbol, Config.MAIN_TIMEFRAME, 50)
+            try:
+                h = df_15m['high']; l = df_15m['low']; c = df_15m['close']
+                tr      = pd.concat([h - l, abs(h - c.shift()), abs(l - c.shift())], axis=1).max(axis=1)
+                atr_val = float(tr.rolling(14).mean().iloc[-1])
+            except Exception:
+                atr_val = abs(entry - sl) * 0.5
+
+            price_deviation      = abs(current_price - entry)
+            max_allowed_deviation = atr_val * 0.5
+
+            if price_deviation > max_allowed_deviation:
+                logger.warning(
+                    f"[SKIP] Price {current_price:.5f} too far from entry {entry:.5f} "
+                    f"(deviation {price_deviation:.5f} > allowed {max_allowed_deviation:.5f})"
+                )
+                self.notifier.send(
+                    f"⚠️ SIGNAL SKIPPED (PRICE MOVED)\n\n"
+                    f"Symbol: {symbol}\nEntry zone: {entry:.5f}\n"
+                    f"Current: {current_price:.5f}\n"
+                    f"Deviation: {price_deviation:.5f} (max {max_allowed_deviation:.5f})",
+                    urgent=False
+                )
+                return
+
+            # ── 6. Market or Limit ──
+            price_at_zone  = price_deviation <= atr_val * 0.1
+            order_type_used = "MARKET" if price_at_zone else "LIMIT"
+
+            if price_at_zone:
+                ticket = self.mt5.open_trade(
+                    symbol=broker_symbol, direction=direction,
+                    lot=lot, sl=sl, tp=tp_final,
+                    comment=f"MANUAL_{signal['source']}"
+                )
+            else:
+                ticket = self.mt5.open_limit_order(
+                    symbol=broker_symbol, direction=direction,
+                    lot=lot, price=entry, sl=sl, tp=tp_final,
+                    comment=f"LIMIT_{signal['source']}",
+                    expiry_hours=48
+                )
+
+            if ticket:
+                self.position_tracker.track_position(ticket, {
+                    'symbol':    broker_symbol,
+                    'direction': direction,
+                    'entry':     entry,
+                    'tp1':       signal.get('tp1'),
+                    'tp2':       signal.get('tp2'),
+                    'tp3':       signal.get('tp3'),
+                    'tp4':       signal.get('tp4'),
+                    'tp_final':  tp_final,
+                    'sl':        sl,
+                    'source':    signal.get('source', 'MANUAL'),
+                })
+
+                # 🆕 Journal: log open
+                self.trade_journal.log_trade_open(
+                    ticket=ticket, symbol=symbol,
+                    direction=direction, entry=entry
+                )
+
+                tp_text = "\n".join(
+                    f"TP{i}: {signal[f'tp{i}']:.5f}"
+                    for i in range(1, 5)
+                    if signal.get(f'tp{i}')
+                )
+
+                self.notifier.send(
+                    f"✅ MANUAL TRADE ({order_type_used})\n\n"
+                    f"Symbol: {symbol}\n"
+                    f"Direction: {direction}\n"
+                    f"{'Price' if order_type_used == 'LIMIT' else 'Entry'}: {entry:.5f}\n"
+                    f"{tp_text}\n"
+                    f"→ MT5 TP set to: {tp_final:.5f}\n"
+                    f"SL: {sl:.5f}\n"
+                    f"Lot: {lot:.2f}\n"
+                    f"Ticket: #{ticket}\n"
+                    f"Source: {signal['source']}",
+                    urgent=True
+                )
+                logger.info(f"[OK] Manual {order_type_used}: #{ticket} {symbol} {direction}")
+            else:
+                logger.error(f"[FAILED] Could not open manual trade for {symbol}")
+                self.notifier.send(
+                    f"❌ TRADE FAILED\n\nSymbol: {symbol}\nDirection: {direction}\n"
+                    f"Could not open position",
+                    urgent=True
+                )
+
+        except Exception as e:
+            logger.error(f"Execute manual signal error: {e}")
+
+# ==================== MAIN ENTRY POINT ====================
+if __name__ == "__main__":
+    logger.info("="*60)
+    logger.info("FOREX TRADING BOT - FIXED VERSION")
+    logger.info("Balanced scoring + Improved entry timing + ADX filter")
+    logger.info("="*60)
+
+    bot = ForexTradingBot()
+    bot.start()
